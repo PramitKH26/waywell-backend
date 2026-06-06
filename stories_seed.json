@@ -1,0 +1,67 @@
+[
+  {
+    "author_name": "Aman",
+    "college": "BITS Pilani",
+    "grad_year": "2017",
+    "what_was_hard": "All of it at once. Academic pressure, identity confusion about where I was heading, the loneliness of feeling invisible, a relationship breakdown, and the mental health spiral underneath everything. It wasn't one thing — it was everything pressing in at the same time.",
+    "lowest_moment": "Not leaving my room for days. Skipping meals at the mess because going meant being seen.",
+    "what_helped": "I'd rather not put the specifics here. But it did pass — and it passed because I let time do its work.",
+    "where_now": "Better than before. Things turned out better than I ever expected they would.",
+    "one_wish": "Time changes everything. The thing crushing you today won't crush you forever.",
+    "categories": ["mental_health", "loneliness", "academic_pressure", "relationship_breakdown", "identity_crisis"],
+    "consent_level": "first_name_only",
+    "approved": true
+  },
+  {
+    "author_name": "Srijan",
+    "college": "BITS Pilani",
+    "grad_year": "2020",
+    "what_was_hard": "I had to undergo surgery in my second year (semester 3-1). Recovering from surgery while sitting for exams was genuinely scary. Beyond that, I was also wrestling with what I actually wanted to do with my life — not just what was expected of me.",
+    "lowest_moment": "Sitting for exams while still recovering from surgery. Holding a pen felt heavier than the questions on the paper.",
+    "what_helped": "Friends. Friends. Friends. Everything in life rests on the friends you make in college. I leaned on mine completely.",
+    "where_now": "Went to MIT, then HEC. Worked in operations for a while, and now I've started three startups.",
+    "one_wish": "Finding what you love doing matters way more than slogging for money.",
+    "categories": ["mental_health", "identity_crisis", "academic_pressure"],
+    "consent_level": "first_name_only",
+    "approved": true
+  },
+  {
+    "author_name": "Akhil",
+    "college": "BITS Pilani Hyderabad",
+    "grad_year": "2024",
+    "what_was_hard": "The sudden shift from 12th to engineering was harder than I expected. Everything used to be laid out for me by teachers and parents — college was the opposite. I couldn't blend in, struggled to make friends, didn't know how to talk to seniors. I started attending classes just to escape the loneliness of my room, but I wasn't actually paying attention. My grades suffered in first year. Then COVID hit and stripped away whatever options I had to explore campus and find my people.",
+    "lowest_moment": "Walking to classes I wasn't even listening in. Just so I wouldn't have to sit alone in my room.",
+    "what_helped": "Having a backup career mattered more than I realised at the time. I was all in on finance initially, but didn't get a PPO due to company restructuring, and on-campus placements went average. Product management was something I'd been quietly exploring on the side. I went after it through off-campus applications — no internships, no obvious path — and that's what worked. The backup carried me when the main plan didn't.",
+    "where_now": "APM at a realty-tech firm. Stable, working on things I find interesting. Came into college as an introvert; left as an extrovert.",
+    "one_wish": "Performing in courses is fine, but go out and actually live. Make friends. Talk to seniors. Find a faculty member in the field you care about and ask them questions. That's where the college years actually pay off.",
+    "categories": ["placement_anxiety", "loneliness", "academic_pressure", "family_pressure", "identity_crisis"],
+    "consent_level": "first_name_only",
+    "approved": true
+  },
+  {
+    "author_name": "A BITSian (EEE, 2015)",
+    "college": "BITS Pilani Goa",
+    "grad_year": "2015",
+    "what_was_hard": "Placements with no clarity and no roadmap. Being in EEE meant core companies wouldn't come — it was always going to be IT. Previous batches hadn't placed well, there wasn't enough guidance on what to prepare, and the uncertainty of not knowing what CGPA cutoffs would be made everything feel like a guessing game.",
+    "lowest_moment": "The feeling that campus uncertainties had put you in a mess with no way out — watching other branches have clearer paths while EEE felt like a dead end for placements.",
+    "what_helped": "Friends on and off campus who never let me feel alone. A senior-run initiative called 'Seniors On Call' that BITS Goa started — placement prep sessions where you could actually ask real questions. A semester before placements, I started interviewing placed seniors myself — what they prepared, how they cracked it. Then I used my holidays to practice DSA intensively. One friend kept saying 'Give me a favor, don't stress' — I still remember that.",
+    "where_now": "First non-CS guy placed that year. One company → startup for 3 years → FAANG for 6 years with multiple promotions → left to join seniors at a new startup as founding engineer. Doing well and genuinely satisfied.",
+    "one_wish": "The BITSian tag helps you more than you think once you step out. It's hard to fail with it. Trust that more than your branch or your CGPA.",
+    "categories": ["placement_anxiety", "academic_pressure", "identity_crisis", "loneliness"],
+    "consent_level": "anonymous",
+    "approved": true
+  },
+  {
+    "author_name": "Stuti",
+    "college": "BITS Pilani",
+    "grad_year": "2025",
+    "what_was_hard": "Loneliness, a relationship falling apart, and placement pressure all hitting at the same time. Not having a roommate made the loneliness sharper. For a long time I was focused entirely on everything that was wrong — and without someone to reality-check that, it just built up.",
+    "lowest_moment": "Being alone in my room with no roommate, building up problems in my head until they felt enormous — with no one physically nearby to break that spiral.",
+    "what_helped": "I identified one friend and made it a daily thing — just ranting everything to her. What made it feel safe was that she'd ask first: 'Do you want to rant, or do you want my opinion?' That made it feel like a real safe space, not advice I didn't ask for. She'd also crack really silly childish jokes at random moments. That helped my mood more than anything serious ever did.",
+    "where_now": "Doing well. The experience taught me coping mechanisms I still use for corporate pressure now.",
+    "one_wish": "Find one person you can be completely unfiltered with. Not someone who fixes things — someone who just listens and knows when to be silly.",
+    "categories": ["loneliness", "relationship_breakdown", "placement_anxiety", "family_pressure"],
+    "consent_level": "anonymous",
+    "approved": true
+  }
+]
