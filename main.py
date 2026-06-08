@@ -1,3 +1,4 @@
+import time
 from fastapi import FastAPI
 from pydantic import BaseModel
 import google.genai as genai
@@ -12,9 +13,7 @@ load_dotenv()
 app = FastAPI()
 
 # Gemini Client
-client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY")
-)
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # Supabase Client
 supabase = create_client(
@@ -45,61 +44,48 @@ async def health():
 
 
 # ----------------------------
-# EMBEDDINGS
+# HELPERS
 # ----------------------------
+def get_display_name(story):
+    """Return a safe display name for a story author."""
+    return (
+        story.get("author_name")
+        or story.get("name")
+        or "a student"
+    )
+
+
 def get_embedding(text):
     try:
         response = client.models.embed_content(
             model="gemini-embedding-001",
             contents=text,
-            config={
-                "output_dimensionality": 768
-            }
+            config={"output_dimensionality": 768},
         )
-
         return response.embeddings[0].values
-
     except Exception as e:
-        print(f"Embedding Error: {e}")
+        print(f"[EMBEDDING] Error: {e}")
         return None
 
 
-# ----------------------------
-# STORY SEARCH
-# ----------------------------
 def search_stories(query_embedding):
     try:
         result = supabase.rpc(
             "match_stories",
-            {
-                "query_embedding": query_embedding,
-                "match_count": 2
-            }
+            {"query_embedding": query_embedding, "match_count": 2},
         ).execute()
-
         return result.data or []
-
     except Exception as e:
-        print(f"Supabase Search Error: {e}")
+        print(f"[SEARCH] Error: {e}")
         return []
 
 
-# ----------------------------
-# CRISIS DETECTION
-# ----------------------------
 def is_crisis(text):
     crisis_words = [
-        "suicide",
-        "kill myself",
-        "want to die",
-        "end it",
-        "better off without me",
-        "can't go on",
-        "no point living"
+        "suicide", "kill myself", "want to die", "end it",
+        "better off without me", "can't go on", "no point living",
     ]
-
     text_lower = text.lower()
-
     return any(word in text_lower for word in crisis_words)
 
 
@@ -108,131 +94,156 @@ def is_crisis(text):
 # ----------------------------
 @app.post("/chat")
 async def chat(message: Message):
+    t0 = time.time()
+    history_len = len(getattr(message, "history", []))
+    print(f"[CHAT] Request received, history: {history_len} msgs")
+
     try:
-        # Crisis Mode — always check first
+        # ── Crisis check (fast path, no LLM needed) ──────────────────────────
         if is_crisis(message.text):
+            print(f"[CHAT] Crisis path, total: {time.time()-t0:.2f}s")
             return {
-                "response": "It sounds like things feel very heavy right now. Please reach out to someone who can help.",
+                "response": (
+                    "It sounds like things feel very heavy right now. "
+                    "Please reach out to someone who can help immediately."
+                ),
                 "helplines": {
-                    "iCall": "9152987821",
-                    "Vandrevala": "1860-2662-345"
+                    "iCall":      "9152987821",
+                    "Vandrevala": "1860-2662-345",
+                    "KIRAN":      "1800-599-0019",
                 },
                 "is_crisis": True,
-                "story": None
+                "story": None,
             }
 
-        # Get embeddings
+        # ── Embedding ─────────────────────────────────────────────────────────
+        t1 = time.time()
         query_embedding = get_embedding(message.text)
+        print(f"[CHAT] Embedding: {time.time()-t1:.2f}s")
 
-        # Search stories
+        # ── Story search ──────────────────────────────────────────────────────
+        t2 = time.time()
         stories = []
-
         if query_embedding:
             stories = search_stories(query_embedding)
+        print(f"[CHAT] Supabase search: {time.time()-t2:.2f}s, "
+              f"{len(stories)} stories found")
 
-        # Safe story context builder
+        # ── Story context ─────────────────────────────────────────────────────
         if stories:
-            story_context = "\n\n".join([
-                f"Story from {s.get('author_name', s.get('content', '').split(',')[0].replace('Author: ', '') if 'Author:' in s.get('content', '') else 'a student')} "
-                f"({s.get('college', '')}):\n"
-                f"{s.get('content', '')}"
-                for s in stories
-                if s.get("content")
-            ])
+            parts = []
+            for s in stories:
+                # Support both structured fields and legacy 'content' field
+                if s.get("what_was_hard") or s.get("what_helped"):
+                    parts.append(
+                        f"Story from {get_display_name(s)}:\n"
+                        f"What was hard: {s.get('what_was_hard', '')}\n"
+                        f"What helped: {s.get('what_helped', '')}\n"
+                        f"Where they are now: {s.get('where_now', '')}"
+                    )
+                elif s.get("content"):
+                    parts.append(
+                        f"Story from {get_display_name(s)} "
+                        f"({s.get('college', '')}):\n"
+                        f"{s.get('content', '')}"
+                    )
+            story_context = "\n\n".join(parts)
         else:
             story_context = ""
 
-        # ── Memory instruction (appended to every system prompt) ──────────────
-        memory_note = (
-            "\n\nUse the conversation history to personalise your responses. "
-            "If the user has shared personal details (anxiety, fear of judgment, "
-            "specific struggles), remember them and adapt your tone accordingly. "
-            "Never ask for information the user has already shared."
+        # ── System prompt ─────────────────────────────────────────────────────
+        memory_rule = (
+            "\n\nMEMORY RULE: Use the conversation history to personalise "
+            "your responses. If the user has shared personal details "
+            "(anxiety, fear of judgment, specific struggles), remember them "
+            "and adapt your tone. Never ask for information already shared."
         )
 
-        # System prompt — with or without stories
         if story_context:
             system_prompt = (
-                "You are a warm, peer support companion for Indian engineering college students.\n"
-                "You are NOT a therapist. You cannot diagnose or treat anyone.\n\n"
+                "You are a warm peer support companion for Indian engineering "
+                "college students. You are NOT a therapist.\n\n"
+                "CRITICAL PRIVACY RULE: Only use the name or identifier given "
+                "in the story context below. Never guess or reveal a real name "
+                "beyond what is provided.\n\n"
                 "Your approach:\n"
                 "- Validate feelings first, always\n"
                 "- Ask one gentle question at a time\n"
-                "- Keep responses to 3-4 sentences max\n"
+                "- Keep responses to 3-4 sentences maximum\n"
                 "- Never give generic advice\n"
-                "- Gently suggest real support if needed\n"
-                "- Reference the real story below to show the student they are not alone\n"
-                "- Weave the story naturally — don't just quote it, use it to connect\n\n"
-                "Real stories from people who felt similar:\n"
+                "- Reference the real story below naturally to show they're not alone\n"
+                "- If they need more support, gently suggest talking to someone real\n\n"
+                "Real story from someone who felt similar:\n"
                 + story_context
-                + memory_note
+                + memory_rule
             )
         else:
             system_prompt = (
-                "You are a warm, peer support companion for Indian engineering college students.\n"
-                "You are NOT a therapist. You cannot diagnose or treat anyone.\n\n"
+                "You are a warm peer support companion for Indian engineering "
+                "college students. You are NOT a therapist.\n\n"
                 "Your approach:\n"
                 "- Validate feelings first, always\n"
                 "- Ask one gentle question at a time\n"
-                "- Keep responses to 3-4 sentences max\n"
+                "- Keep responses to 3-4 sentences maximum\n"
                 "- Never give generic advice\n"
-                "- Be warm, honest, and human\n"
-                "- You don't have a specific story to share right now, but respond with genuine care and curiosity\n"
-                "- If they seem to need more support, gently suggest talking to someone real\n"
-                "- For casual messages (greetings, small talk), respond naturally and warmly like a friend would\n\n"
-                "No specific story is available for this message — respond with warmth and be natural."
-                + memory_note
+                "- Be warm, honest, and genuinely caring\n"
+                "- If they need more support, gently suggest talking to someone real\n"
+                "- For casual messages or greetings, respond naturally like a friend\n\n"
+                "No specific story available — respond with warmth and genuine curiosity."
+                + memory_rule
             )
 
-        # ── Build Gemini contents array (conversation history + current turn) ─
+        # ── Build Gemini multi-turn contents ──────────────────────────────────
         contents = []
-        # Previous turns (all history before this message)
         for msg in message.history:
             role = "user" if msg.get("role") == "user" else "model"
             contents.append({
-                "role": role,
+                "role":  role,
                 "parts": [{"text": msg.get("content", "")}],
             })
-        # Current turn — system prompt prepended so Gemini always has context
+        # Append current turn with system prompt prepended
         contents.append({
-            "role": "user",
+            "role":  "user",
             "parts": [{"text": f"{system_prompt}\n\nStudent says: {message.text}"}],
         })
 
-        # Generate response — always works, with or without stories
+        # ── Gemini call ───────────────────────────────────────────────────────
+        t3 = time.time()
         try:
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-2.5-flash-lite",
                 contents=contents,
+                config={
+                    "max_output_tokens": 200,   # ~3-4 sentences; keeps latency low
+                    "temperature":       0.7,
+                },
             )
             reply_text = response.text
-
+            print(f"[CHAT] Gemini: {time.time()-t3:.2f}s, "
+                  f"{len(reply_text)} chars")
         except Exception as e:
-            print(f"Gemini error: {e}")
+            print(f"[CHAT] Gemini ERROR after {time.time()-t3:.2f}s: {e}")
             reply_text = (
-                "I hear you. Sometimes things feel "
-                "heavy and hard to put into words. "
-                "What's been on your mind the most today?"
+                "I hear you. Sometimes things feel heavy and hard to put "
+                "into words. What's been on your mind the most today?"
             )
 
-        # Safe return
         matched_story = stories[0] if stories else None
+        print(f"[CHAT] TOTAL: {time.time()-t0:.2f}s")
 
         return {
-            "reply": reply_text,      # primary field Flutter reads
-            "response": reply_text,   # backward-compat alias
+            "response":  reply_text,
             "is_crisis": False,
-            "story": matched_story,
+            "story":     matched_story,
         }
 
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        print(f"[CHAT] FATAL ERROR after {time.time()-t0:.2f}s: {e}")
         return {
             "response": (
-                "I hear you. I'm having a little trouble "
-                "right now, but I'm here. What's been on "
-                "your mind?"
+                "I hear you. I'm having a little trouble right now, "
+                "but I'm here. What's been on your mind?"
             ),
             "is_crisis": False,
-            "story": None
+            "story":     None,
         }
