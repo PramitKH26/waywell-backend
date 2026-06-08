@@ -152,50 +152,67 @@ async def chat(message: Message):
             story_context = ""
 
         # ── System prompt ─────────────────────────────────────────────────────
-        memory_rule = (
-            "\n\nMEMORY RULE: Use the conversation history to personalise "
-            "your responses. If the user has shared personal details "
-            "(anxiety, fear of judgment, specific struggles), remember them "
-            "and adapt your tone. Never ask for information already shared."
-        )
-
         if story_context:
             system_prompt = (
-                "You are a warm peer support companion for Indian engineering "
-                "college students. You are NOT a therapist.\n\n"
-                "CRITICAL PRIVACY RULE: Only use the name or identifier given "
-                "in the story context below. Never guess or reveal a real name "
-                "beyond what is provided.\n\n"
-                "Your approach:\n"
-                "- Validate feelings first, always\n"
-                "- Ask one gentle question at a time\n"
-                "- Keep responses to 3-4 sentences maximum\n"
-                "- Never give generic advice\n"
-                "- Reference the real story below naturally to show they're not alone\n"
-                "- If they need more support, gently suggest talking to someone real\n\n"
+                "You are a warm, caring peer companion for Indian engineering "
+                "college students going through hard times.\n\n"
+                "You are NOT a therapist. You cannot diagnose or treat. "
+                "You are a friend who listens well.\n\n"
+                "PRIVACY RULE:\n"
+                "Only use the name or identifier given in the story context. "
+                "Never reveal real names beyond what is provided.\n\n"
+                "MEMORY RULE:\n"
+                "Remember everything the student has shared in this conversation. "
+                "Never ask again for something they already told you. "
+                "Reference their specific details naturally.\n\n"
+                "HOW TO RESPOND:\n"
+                "- Start by genuinely acknowledging what they said — not a generic "
+                "'I hear you' but something specific to their exact words\n"
+                "- Bring in the real story below naturally, like a friend saying "
+                "'you know, someone I know went through something similar…' "
+                "— never forced, never clinical\n"
+                "- Ask ONE gentle question to understand more\n"
+                "- Keep the tone like a caring senior student talking to a junior, "
+                "not a counsellor talking to a patient\n"
+                "- 5-6 sentences maximum\n"
+                "- Never give a list of advice\n"
+                "- Never say 'it's important to…'\n"
+                "- Never start with 'I'\n\n"
                 "Real story from someone who felt similar:\n"
                 + story_context
-                + memory_rule
             )
         else:
             system_prompt = (
-                "You are a warm peer support companion for Indian engineering "
-                "college students. You are NOT a therapist.\n\n"
-                "Your approach:\n"
-                "- Validate feelings first, always\n"
-                "- Ask one gentle question at a time\n"
-                "- Keep responses to 3-4 sentences maximum\n"
-                "- Never give generic advice\n"
-                "- Be warm, honest, and genuinely caring\n"
-                "- If they need more support, gently suggest talking to someone real\n"
-                "- For casual messages or greetings, respond naturally like a friend\n\n"
-                "No specific story available — respond with warmth and genuine curiosity."
-                + memory_rule
+                "You are a warm, caring peer companion for Indian engineering "
+                "college students going through hard times.\n\n"
+                "You are NOT a therapist. You cannot diagnose or treat. "
+                "You are a friend who listens well.\n\n"
+                "MEMORY RULE:\n"
+                "Remember everything the student has shared in this conversation. "
+                "Never ask again for something they already told you.\n\n"
+                "HOW TO RESPOND:\n"
+                "- Start by genuinely acknowledging what they said — not generic "
+                "but specific to their exact words\n"
+                "- Ask ONE gentle question to understand more\n"
+                "- Keep the tone like a caring senior student talking to a junior, "
+                "not a counsellor talking to a patient\n"
+                "- 5-6 sentences maximum\n"
+                "- Never give a list of advice\n"
+                "- Never say 'it's important to…'\n"
+                "- Never start with 'I'\n"
+                "- For casual messages or greetings, respond warmly like a friend\n\n"
+                "No specific story available — respond with genuine warmth and curiosity."
             )
 
         # ── Build Gemini multi-turn contents ──────────────────────────────────
+        history = getattr(message, "history", [])
+        # Cap to last 20 entries (10 exchanges) so long conversations
+        # don't inflate the prompt and slow down the response.
+        if len(history) > 20:
+            history = history[-20:]
+
         contents = []
-        for msg in message.history:
+        for msg in history:
             role = "user" if msg.get("role") == "user" else "model"
             contents.append({
                 "role":  role,
@@ -211,11 +228,11 @@ async def chat(message: Message):
         t3 = time.time()
         try:
             response = client.models.generate_content(
-                model="gemini-2.5-flash-lite",
+                model="gemini-2.5-flash",
                 contents=contents,
                 config={
-                    "max_output_tokens": 200,   # ~3-4 sentences; keeps latency low
-                    "temperature":       0.7,
+                    "max_output_tokens": 400,   # ~5-6 warm sentences
+                    "temperature":       0.8,   # slightly higher → more natural, less formulaic
                 },
             )
             reply_text = response.text
