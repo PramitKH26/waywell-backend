@@ -80,6 +80,25 @@ def search_stories(query_embedding):
         return []
 
 
+def clean_story(story):
+    """Strip the heavy embedding (and any other large internal fields) before
+    returning a story to the app.  The client only needs display fields, so
+    shipping the 1500-float embedding on every reply just bloats the payload
+    and stalls slow mobile connections."""
+    if not story:
+        return None
+    return {
+        "id":            story.get("id"),
+        "content":       story.get("content"),
+        "author_name":   story.get("author_name"),
+        "person_name":   story.get("person_name"),
+        "college":       story.get("college"),
+        "what_was_hard": story.get("what_was_hard"),
+        "what_helped":   story.get("what_helped"),
+        "where_now":     story.get("where_now"),
+    }
+
+
 def is_crisis(text):
     crisis_words = [
         "suicide", "kill myself", "want to die", "end it",
@@ -233,6 +252,12 @@ async def chat(message: Message):
                 config={
                     "max_output_tokens": 400,   # ~5-6 warm sentences
                     "temperature":       0.8,   # slightly higher → more natural, less formulaic
+                    # CRITICAL: gemini-2.5-flash is a "thinking" model.  By
+                    # default its hidden reasoning tokens are charged against
+                    # max_output_tokens, which truncated replies mid-sentence
+                    # and slowed every call.  thinking_budget=0 disables it —
+                    # peer-support replies need warmth, not chain-of-thought.
+                    "thinking_config": {"thinking_budget": 0},
                 },
             )
             reply_text = response.text
@@ -245,7 +270,7 @@ async def chat(message: Message):
                 "into words. What's been on your mind the most today?"
             )
 
-        matched_story = stories[0] if stories else None
+        matched_story = clean_story(stories[0]) if stories else None
         print(f"[CHAT] TOTAL: {time.time()-t0:.2f}s")
 
         return {
