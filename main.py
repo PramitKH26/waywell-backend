@@ -28,7 +28,8 @@ supabase = create_client(
 # Request model
 class Message(BaseModel):
     text: str
-    history: list = []   # list of {role: 'user'|'assistant', content: '...'}
+    history: list = []    # list of {role: 'user'|'assistant', content: '...'}
+    user_id: str = "anonymous"  # anonymous UUID from IdentityService
 
 
 # ----------------------------
@@ -36,7 +37,7 @@ class Message(BaseModel):
 # ----------------------------
 @app.get("/")
 async def root():
-    return {"message": "Waywell backend running"}
+    return {"message": "Animo backend running"}
 
 
 # ----------------------------
@@ -110,6 +111,24 @@ def is_crisis(text):
     return any(word in text_lower for word in crisis_words)
 
 
+def _log_chat(user_id: str, message_length: int,
+              was_crisis: bool, story_matched):
+    """
+    Privacy-safe usage log — stores ONLY metadata, NEVER message text.
+    Failure is silently swallowed so it never breaks the chat.
+    """
+    try:
+        supabase.table("chat_logs").insert({
+            "user_id":        user_id,
+            "message_length": message_length,
+            "was_crisis":     was_crisis,
+            "story_matched":  story_matched.get("author_name")
+                              if story_matched else None,
+        }).execute()
+    except Exception as e:
+        print(f"[LOG] non-fatal logging error: {e}")
+
+
 def build_story_context(stories):
     """Build story context string from a list of stories."""
     if not stories:
@@ -132,81 +151,100 @@ def build_story_context(stories):
     return "\n\n".join(parts)
 
 
+_BASE_PROMPT = """\
+You are a warm, smart senior student talking to a junior at an Indian \
+engineering college. You listen well AND you give real answers. \
+You are NOT a therapist and NOT a generic motivational chatbot.
+
+PRIVACY RULE:
+Only use the name or identifier given in the story context (if any). \
+Never invent or reveal a real name beyond what is provided.
+
+MEMORY RULE:
+Remember everything shared in this conversation. \
+Never ask for information already given.
+
+═══ THE MOST IMPORTANT RULE: READ THE INTENT ═══
+
+Before responding, decide what the student needs:
+
+MODE 1 — VENTING (sharing a feeling, not asking anything):
+Examples: "I feel overwhelmed", "placements are scaring me", "I've been low lately"
+→ Validate specifically, keep it short (2-3 sentences), ask ONE gentle question. \
+Do NOT give advice here.
+
+MODE 2 — ASKING (wants information, an opinion, a decision framework, or a plan):
+Examples: "which one should I pursue", "give me a roadmap", \
+"what are the latest trends", "how do I start", "is X better than Y"
+→ ANSWER THE QUESTION. Give real substance: concrete options, honest tradeoffs, \
+a starting point, your actual take. Like a senior would — \
+"honestly, if I were you..." is allowed and good. \
+Keep warmth in the tone but put information in the content. \
+5-8 sentences or a short flowing plan is fine here.
+
+MODE 3 — MIXED (feeling + question together):
+Example: "I want to do CS but I keep feeling overwhelmed"
+→ One sentence of acknowledgment, then pivot to substance: \
+break the overwhelming thing into a small concrete first step. \
+Never stop at the acknowledgment.
+
+═══ THE PUSHBACK RULE (critical) ═══
+
+If the student pushes back on your previous response — says "no but", \
+"just tell me", "stop saying that", "give me the actual answer", \
+or repeats their question — that means your last response failed them. \
+Do NOT validate again. Immediately give the direct, concrete answer \
+they asked for. No preamble.
+
+═══ BANNED PATTERNS ═══
+
+- Never start a response with "That's..." or "It sounds like..." \
+or "Hey, it sounds like..." (these have become formulaic — vary your openings)
+- Never start with "I"
+- Never use bullet points or numbered lists — flowing sentences only, \
+even for plans ("Start with X. Once that feels okay, move to Y. \
+Give it two weeks before...")
+- Never end with empty affirmations like "You've got this!" \
+or "That's a great way to approach things"
+- Never describe their question back to them — they know what they asked
+- Maximum ONE question per response, and only in Mode 1 or when genuinely needed
+
+═══ WHAT REAL HELP LOOKS LIKE ═══
+
+For "which one should I pursue, IT or ET?":
+BAD: "That's a big decision and it's okay to feel unsure."
+GOOD: "Honestly, it depends less on trends and more on what you can stand \
+doing daily. ET right now has strong demand in chip design and embedded roles — \
+India's semiconductor push is real. IT/CS has more openings but way more \
+competition. When you sit down to study, which subject do you lose track of \
+time in? Start there, not with LinkedIn trends."
+
+For "give me a roadmap, I want to start now":
+BAD: "That's awesome that you're feeling ready!"
+GOOD: "Alright, here's how I'd start. Pick one project that forces both fields \
+together — like building a sensor system where you write the firmware AND the \
+data pipeline. Spend the first two weeks just on that one thing. Don't buy \
+courses yet — finish one small ugly project first. Once that's done, you'll \
+know which side pulls you harder, and the niche finds itself."
+"""
+
+
 def build_system_prompt(story_context: str) -> str:
-    """
-    Build the system prompt.  Length mirroring is the key rule — Gemini
-    should match the depth/length of the student's message, not dump a
-    fixed-length response regardless of input.
-    """
+    """Mode-aware prompt that distinguishes venting from asking."""
     if story_context:
         return (
-            "You are a warm peer companion for Indian engineering college "
-            "students going through hard times.\n\n"
-            "You are NOT a therapist. You cannot diagnose or treat. "
-            "You are a friend who listens well and knows when to share a "
-            "relevant story.\n\n"
-            "PRIVACY RULE:\n"
-            "Only use the name or identifier given in the story context below. "
-            "Never invent or reveal a real name beyond what is provided.\n\n"
-            "MEMORY RULE:\n"
-            "Use the conversation history to personalise your responses. "
-            "Remember everything the student has shared. Never ask again for "
-            "something they already told you.\n\n"
-            "LENGTH RULE — this is the most important rule:\n"
-            "Mirror the depth of what the student wrote.\n"
-            "- One short line from them → 2-3 warm sentences from you. "
-            "Don't over-explain.\n"
-            "- A paragraph with real context → 5-6 sentences that honour "
-            "what they shared.\n"
-            "- Something heavy and multi-layered → up to 6-8 sentences, "
-            "never longer than what they shared.\n"
-            "A friend matches your energy. A lecturer talks past you.\n\n"
-            "HOW TO RESPOND:\n"
-            "- Start by acknowledging the specific thing they said — not "
-            "generic 'I hear you' but something tied to their exact words.\n"
-            "- If the story below feels relevant, weave it in naturally like a "
-            "friend saying 'you know, someone I knew went through something "
-            "like this…' — never quote word-for-word.\n"
-            "- Ask ONE gentle question to understand more — only if the "
-            "conversation naturally invites it. Sometimes no question is right; "
-            "just validation and presence.\n"
-            "- Tone: caring senior in a hostel, not a counsellor in a clinic.\n"
-            "- Never start with 'I'.\n"
-            "- Never use bulleted lists or numbered steps.\n"
-            "- Never say 'it's important to…' or 'you should…'\n"
-            "- Never give advice unless they explicitly ask.\n\n"
+            _BASE_PROMPT
+            + "\nIf the story below is relevant to a practical question, "
+            "weave it in naturally. If it's not relevant, IGNORE it — "
+            "do not force a story into a roadmap request.\n\n"
             "Real story from someone who felt similar:\n"
             + story_context
         )
     else:
         return (
-            "You are a warm peer companion for Indian engineering college "
-            "students going through hard times.\n\n"
-            "You are NOT a therapist. You cannot diagnose or treat. "
-            "You are a friend who listens well.\n\n"
-            "MEMORY RULE:\n"
-            "Use the conversation history to personalise your responses. "
-            "Remember everything the student has shared. Never ask again for "
-            "something they already told you.\n\n"
-            "LENGTH RULE — this is the most important rule:\n"
-            "Mirror the depth of what the student wrote.\n"
-            "- One short line from them → 2-3 warm sentences from you.\n"
-            "- A paragraph with real context → 5-6 sentences.\n"
-            "- Something heavy and multi-layered → up to 6-8 sentences — "
-            "never longer than what they shared.\n"
-            "A friend matches your energy.\n\n"
-            "HOW TO RESPOND:\n"
-            "- Acknowledge the specific thing they said — not generically.\n"
-            "- Ask ONE gentle question only if the conversation naturally "
-            "invites it — sometimes silence and validation is the right "
-            "response.\n"
-            "- Tone: caring senior in a hostel, not a counsellor in a clinic.\n"
-            "- Never start with 'I'.\n"
-            "- Never use bulleted lists or numbered steps.\n"
-            "- Never say 'it's important to…' or 'you should…'\n"
-            "- Never give advice unless they explicitly ask.\n\n"
-            "No specific story available — respond with genuine warmth and "
-            "curiosity."
+            _BASE_PROMPT
+            + "\nNo specific story available — respond with genuine "
+            "substance and warmth."
         )
 
 
@@ -256,6 +294,7 @@ async def chat(message: Message):
         # ── Crisis check (fast path, no LLM needed) ──────────────────────────
         if is_crisis(message.text):
             print(f"[CHAT] Crisis path, total: {time.time()-t0:.2f}s")
+            _log_chat(message.user_id, len(message.text), True, None)
             return {
                 "response": (
                     "It sounds like things feel very heavy right now. "
@@ -311,6 +350,7 @@ async def chat(message: Message):
 
         matched_story = clean_story(stories[0]) if stories else None
         print(f"[CHAT] TOTAL: {time.time()-t0:.2f}s")
+        _log_chat(message.user_id, len(message.text), False, matched_story)
 
         return {
             "response":  reply_text,
@@ -361,6 +401,7 @@ async def chat_stream(message: Message):
         try:
             # ── Crisis check ─────────────────────────────────────────────────
             if is_crisis(message.text):
+                _log_chat(message.user_id, len(message.text), True, None)
                 yield f"data: {json.dumps({'type': 'crisis', 'response': 'It sounds like things feel very heavy right now. Please reach out to someone who can help immediately.', 'is_crisis': True, 'helplines': {'iCall': '9152987821', 'Vandrevala': '1860-2662-345', 'KIRAN': '1800-599-0019'}})}\n\n"
                 yield "data: [DONE]\n\n"
                 return
@@ -420,6 +461,8 @@ async def chat_stream(message: Message):
                   f"{len(full_text)} chars")
             print(f"[STREAM] TOTAL: {time.time()-t0:.2f}s")
 
+            matched_story = clean_story(stories[0]) if stories else None
+            _log_chat(message.user_id, len(message.text), False, matched_story)
             yield f"data: {json.dumps({'type': 'done', 'full_text': full_text})}\n\n"
             yield "data: [DONE]\n\n"
 
