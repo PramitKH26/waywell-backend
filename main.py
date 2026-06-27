@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 
 from fastapi import FastAPI
@@ -25,11 +26,28 @@ supabase = create_client(
     os.getenv("SUPABASE_KEY")
 )
 
-# Request model
+# Request models
 class Message(BaseModel):
     text: str
-    history: list = []    # list of {role: 'user'|'assistant', content: '...'}
+    history: list = []          # list of {role: 'user'|'assistant', content: '...'}
     user_id: str = "anonymous"  # anonymous UUID from IdentityService
+    mood_context: dict = {}     # {current_mood, recent_moods}
+
+class MoodLog(BaseModel):
+    user_id: str = "anonymous"
+    mood: str
+    timestamp: str = ""
+    source: str = "app_open"
+
+class MoodAction(BaseModel):
+    user_id: str = "anonymous"
+    initial_mood: str
+    next_action: str
+
+class MoodReflection(BaseModel):
+    user_id: str = "anonymous"
+    before_mood: str
+    after_reflection: str
 
 
 # ----------------------------
@@ -112,7 +130,7 @@ def is_crisis(text):
 
 
 def _log_chat(user_id: str, message_length: int,
-              was_crisis: bool, story_matched):
+              was_crisis: bool, story_matched, edu_topic=None):
     """
     Privacy-safe usage log — stores ONLY metadata, NEVER message text.
     Failure is silently swallowed so it never breaks the chat.
@@ -124,9 +142,20 @@ def _log_chat(user_id: str, message_length: int,
             "was_crisis":     was_crisis,
             "story_matched":  story_matched.get("author_name")
                               if story_matched else None,
+            "edu_topic":      edu_topic,
         }).execute()
     except Exception as e:
         print(f"[LOG] non-fatal logging error: {e}")
+
+
+def strip_edu_tag(text):
+    """Parse and strip the [EDU:topic] tag from Gemini's response."""
+    edu_match = re.search(r'\[EDU:(\w+)\]', text)
+    edu_topic = None
+    if edu_match:
+        edu_topic = edu_match.group(1)
+        text = re.sub(r'\[EDU:\w+\]', '', text).strip()
+    return text, edu_topic
 
 
 def build_story_context(stories):
@@ -213,6 +242,85 @@ or "That's a great way to approach things"
 - Never describe their question back to them — they know what they asked
 - Maximum ONE question per response, and only in Mode 1 or when genuinely needed
 
+═══ PSYCHOEDUCATION RULE ═══
+
+When a student describes a specific feeling or pattern, you may offer a brief \
+(2-3 sentence) explanation of why that happens — but ONLY when it would feel \
+like a caring insight from a knowledgeable friend, not a lecture.
+
+Use it SPARINGLY. One psychoeducation moment per conversation is enough. \
+Do not explain something if the student just wants to vent. Only explain if:
+- They seem confused about why they feel what they feel ("I don't understand \
+why I feel this way", "is this normal", "why does this keep happening")
+- OR an explanation would clearly help them feel less alone or less self-critical
+
+When you do explain, make it feel like something a wise senior would say, \
+not a textbook. Use "your brain" not "the brain". Connect it back to their \
+specific situation.
+
+REFERENCE KNOWLEDGE BASE (adapt the language — never copy verbatim):
+
+COMPARISON & SOCIAL MEDIA PAIN: Your brain is literally wired to benchmark \
+against visible peers — it's a survival mechanism. On campus, you only see \
+the highlights of everyone else's life, which means your brain is comparing \
+your inside to their outside. The gap feels real but the data is skewed.
+
+OVERTHINKING / RUMINATION: When you're sleep-deprived or under stress, your \
+brain's prefrontal cortex — the part that interrupts anxious loops — goes \
+offline first. So the more exhausted you are, the harder it is to stop the \
+spiral. It's not a character flaw, it's neuroscience.
+
+UNCERTAINTY ANXIETY (placements, future): Your brain treats uncertainty like \
+danger — it literally prefers bad news to no news because at least bad news \
+tells it what to prepare for. When outcomes are unknown, your threat system \
+stays on high alert indefinitely. That exhaustion you feel is real — your \
+nervous system has been running a fire alarm with no fire.
+
+BURNOUT: Burnout isn't about working too hard — it's about working without \
+enough recovery. Your brain needs rest to consolidate what you've learned and \
+regulate emotion. When output consistently exceeds recovery, the system \
+depletes. The flat, empty feeling is depletion, not weakness.
+
+PLACEMENT REJECTION FEELING PERSONAL: When we fail at something, our brains \
+default to internal explanations — "I'm not good enough" — even when external \
+factors (ATS systems, company freezes, quota filling) are more likely. OA \
+rejection rates in Indian placements are above 95% for most companies. Your \
+brain is drawing the wrong conclusion from limited data.
+
+SLEEP AND EMOTION: One bad night of sleep increases your anxiety reactivity \
+by around 30% — the amygdala (threat centre) becomes more reactive while the \
+prefrontal cortex (the part that calms it down) goes quieter. When everything \
+feels heavier than it should, check when you last slept properly.
+
+PLURALISTIC IGNORANCE — "EVERYONE ELSE IS FINE": There's a name for what \
+you're describing — pluralistic ignorance. Everyone privately struggles but \
+publicly performs okay, so everyone assumes everyone else is actually fine. \
+Research consistently shows that the students who look most sorted are often \
+the most anxious. You're not uniquely broken — you're just seeing other \
+people's masks.
+
+IMPOSTER SYNDROME AT BITS: Almost everyone who gets to BITS feels at some \
+point like they don't belong here — the people who built this feeling into a \
+concept gave it a name: imposter syndrome. It's most intense when you're \
+surrounded by smart people, which is always at BITS. The fact that you \
+question whether you deserve to be here is actually evidence that you care, \
+not evidence that you don't.
+
+DO NOT use these explanations:
+- If the student is in crisis
+- If they haven't asked why / aren't confused about their experience
+- More than once in a conversation
+- Back to back with another explanation
+- In a tone that sounds clinical or like a list of facts
+
+When you include a psychoeducation moment (a brief explanation of why \
+something happens), add this tag on a new line at the very end of that \
+specific response: [EDU:topic]
+Where topic is one of: comparison, overthinking, uncertainty, burnout, \
+rejection, sleep, pluralistic, imposter, other
+This tag is for internal tracking only. Do NOT include it in any response \
+that does not contain a psychoeducation moment.
+
 ═══ WHAT REAL HELP LOOKS LIKE ═══
 
 For "which one should I pursue, IT or ET?":
@@ -233,12 +341,54 @@ know which side pulls you harder, and the niche finds itself."
 """
 
 
-def build_system_prompt(story_context: str) -> str:
+def build_mood_context_str(mood_context: dict) -> str:
+    """Format mood context for the system prompt."""
+    if not mood_context:
+        return ""
+    current = mood_context.get("current_mood")
+    recent  = mood_context.get("recent_moods", [])
+    if not current:
+        return ""
+    parts = [f"\nCurrent Mood: {current}"]
+    if len(recent) > 1:
+        # Show recent history (skip first which is same as current)
+        history_str = ", ".join(recent[1:4]) if len(recent) > 1 else ""
+        if history_str:
+            parts.append(f"Recent pattern: {history_str}")
+    return "\n".join(parts)
+
+
+_MOOD_STORY_KEYWORDS = {
+    "Overwhelmed": ["pressure", "overwhelmed", "stress", "burnout", "too much"],
+    "Stressed":    ["stress", "anxiety", "placement", "exam", "deadline"],
+    "Lonely":      ["lonely", "isolated", "alone", "friend", "disconnected"],
+    "Tired":       ["tired", "exhausted", "burnout", "sleep"],
+    "Hopeful":     ["hope", "progress", "better", "growth"],
+    "Calm":        [],
+}
+
+
+def build_system_prompt(story_context: str, mood_context: dict = None) -> str:
     """Mode-aware prompt that distinguishes venting from asking."""
+    mood_str = build_mood_context_str(mood_context or {})
+
+    mood_block = ""
+    if mood_str:
+        mood_block = (
+            "\n\n═══ EMOTIONAL CONTEXT (use subtly, not literally) ═══"
+            + mood_str
+            + "\nUse this to calibrate tone only. Do NOT say 'I see you're "
+            "overwhelmed' or repeat mood labels back. Instead, let it shape "
+            "how direct or gentle you are, and whether to acknowledge that "
+            "something has been building over time."
+        )
+
+    base = _BASE_PROMPT + mood_block
+
     if story_context:
         return (
-            _BASE_PROMPT
-            + "\nIf the story below is relevant to a practical question, "
+            base
+            + "\n\nIf the story below is relevant to a practical question, "
             "weave it in naturally. If it's not relevant, IGNORE it — "
             "do not force a story into a roadmap request.\n\n"
             "Real story from someone who felt similar:\n"
@@ -246,8 +396,8 @@ def build_system_prompt(story_context: str) -> str:
         )
     else:
         return (
-            _BASE_PROMPT
-            + "\nNo specific story available — respond with genuine "
+            base
+            + "\n\nNo specific story available — respond with genuine "
             "substance and warmth."
         )
 
@@ -327,7 +477,8 @@ async def chat(message: Message):
               f"{len(stories)} stories found")
 
         story_context = build_story_context(stories)
-        system_prompt = build_system_prompt(story_context)
+        system_prompt = build_system_prompt(
+            story_context, getattr(message, "mood_context", {}))
         contents      = build_contents(
             getattr(message, "history", []),
             system_prompt,
@@ -352,12 +503,18 @@ async def chat(message: Message):
                 "I'm still here."
             )
 
+        reply_text, edu_topic = strip_edu_tag(reply_text)
+        if edu_topic:
+            print(f"[CHAT] EDU tag: {edu_topic}")
+
         matched_story = clean_story(stories[0]) if stories else None
         print(f"[CHAT] TOTAL: {time.time()-t0:.2f}s")
-        _log_chat(message.user_id, len(message.text), False, matched_story)
+        _log_chat(message.user_id, len(message.text), False,
+                  matched_story, edu_topic)
 
         return {
             "response":  reply_text,
+            "edu_topic": edu_topic,
             "is_crisis": False,
             "story":     matched_story,
         }
@@ -428,7 +585,8 @@ async def chat_stream(message: Message):
                 yield f"data: {json.dumps({'type': 'story', 'story': clean_story(stories[0])})}\n\n"
 
             story_context = build_story_context(stories)
-            system_prompt = build_system_prompt(story_context)
+            system_prompt = build_system_prompt(
+                story_context, getattr(message, "mood_context", {}))
             contents      = build_contents(
                 getattr(message, "history", []),
                 system_prompt,
@@ -465,9 +623,14 @@ async def chat_stream(message: Message):
                   f"{len(full_text)} chars")
             print(f"[STREAM] TOTAL: {time.time()-t0:.2f}s")
 
+            full_text, edu_topic = strip_edu_tag(full_text)
+            if edu_topic:
+                print(f"[STREAM] EDU tag: {edu_topic}")
+
             matched_story = clean_story(stories[0]) if stories else None
-            _log_chat(message.user_id, len(message.text), False, matched_story)
-            yield f"data: {json.dumps({'type': 'done', 'full_text': full_text})}\n\n"
+            _log_chat(message.user_id, len(message.text), False,
+                      matched_story, edu_topic)
+            yield f"data: {json.dumps({'type': 'done', 'full_text': full_text, 'edu_topic': edu_topic})}\n\n"
             yield "data: [DONE]\n\n"
 
         except Exception as e:
@@ -488,3 +651,55 @@ async def chat_stream(message: Message):
             "X-Accel-Buffering": "no",  # prevents nginx from buffering chunks
         },
     )
+
+
+# ----------------------------
+# MOOD ENDPOINTS
+# ----------------------------
+
+@app.post("/mood/log")
+async def mood_log(entry: MoodLog):
+    """Store a mood check-in. Non-fatal — never breaks the app."""
+    try:
+        from datetime import datetime, timezone
+        ts = entry.timestamp or datetime.now(timezone.utc).isoformat()
+        supabase.table("mood_logs").insert({
+            "user_id":   entry.user_id,
+            "mood":      entry.mood,
+            "source":    entry.source,
+            "logged_at": ts,
+        }).execute()
+        return {"ok": True}
+    except Exception as e:
+        print(f"[MOOD LOG] non-fatal: {e}")
+        return {"ok": False}
+
+
+@app.post("/mood/action")
+async def mood_action(entry: MoodAction):
+    """Track what the user does immediately after a mood check-in."""
+    try:
+        supabase.table("mood_actions").insert({
+            "user_id":      entry.user_id,
+            "initial_mood": entry.initial_mood,
+            "next_action":  entry.next_action,
+        }).execute()
+        return {"ok": True}
+    except Exception as e:
+        print(f"[MOOD ACTION] non-fatal: {e}")
+        return {"ok": False}
+
+
+@app.post("/mood/reflection")
+async def mood_reflection(entry: MoodReflection):
+    """Store a post-interaction reflection pair."""
+    try:
+        supabase.table("mood_reflections").insert({
+            "user_id":          entry.user_id,
+            "before_mood":      entry.before_mood,
+            "after_reflection": entry.after_reflection,
+        }).execute()
+        return {"ok": True}
+    except Exception as e:
+        print(f"[MOOD REFLECTION] non-fatal: {e}")
+        return {"ok": False}

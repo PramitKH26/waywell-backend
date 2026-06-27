@@ -14,7 +14,7 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+# lib/ removed — Flutter uses lib/ for Dart source
 lib64/
 parts/
 sdist/
