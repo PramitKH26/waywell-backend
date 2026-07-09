@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
@@ -91,15 +92,57 @@ def get_embedding(text):
         return None
 
 
+STORY_STRONG = 0.75
+STORY_WEAK = 0.60
+
+
 def search_stories(query_embedding):
     try:
         result = supabase.rpc(
-            "match_stories",
+            "match_stories_scored",
             {"query_embedding": query_embedding, "match_count": 2},
         ).execute()
         return result.data or []
     except Exception as e:
-        print(f"[SEARCH] Error: {e}")
+        print(f"[SEARCH] Scored RPC failed, falling back: {e}")
+        try:
+            result = supabase.rpc(
+                "match_stories",
+                {"query_embedding": query_embedding, "match_count": 2},
+            ).execute()
+            return result.data or []
+        except Exception as e2:
+            print(f"[SEARCH] Fallback also failed: {e2}")
+            return []
+
+
+def get_match_strength(stories):
+    if not stories:
+        return "NO_MATCH", None
+    score = stories[0].get("similarity", 0)
+    if score == 0:
+        return "UNKNOWN", stories[0]
+    if score >= STORY_STRONG:
+        return "STRONG_MATCH", stories[0]
+    if score >= STORY_WEAK:
+        return "WEAK_MATCH", stories[0]
+    return "NO_MATCH", None
+
+
+def get_used_edu_topics(user_id):
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        result = supabase.table("chat_logs") \
+            .select("edu_topic") \
+            .eq("user_id", user_id) \
+            .gte("created_at", cutoff) \
+            .execute()
+        return list(set(
+            r["edu_topic"] for r in (result.data or [])
+            if r.get("edu_topic")
+        ))
+    except Exception as e:
+        print(f"[EDU] Failed to query used topics: {e}")
         return []
 
 
@@ -181,6 +224,11 @@ def build_story_context(stories):
 
 
 _BASE_PROMPT = """\
+THE FIRST SENTENCE of every response must respond to the human being, not \
+deploy a feature. Acknowledge what they said and how it must feel BEFORE any \
+story, explanation, or suggestion. If you only do one thing in a response, \
+do that.
+
 You are a warm, smart senior student talking to a junior at an Indian \
 engineering college. You listen well AND you give real answers. \
 You are NOT a therapist and NOT a generic motivational chatbot.
@@ -242,80 +290,97 @@ or "That's a great way to approach things"
 - Never describe their question back to them — they know what they asked
 - Maximum ONE question per response, and only in Mode 1 or when genuinely needed
 
-═══ PSYCHOEDUCATION RULE ═══
+═══ RESPONSE SELECTION — decide what THIS message needs before writing ═══
 
-When a student describes a specific feeling or pattern, you may offer a brief \
-(2-3 sentence) explanation of why that happens — but ONLY when it would feel \
-like a caring insight from a knowledgeable friend, not a lecture.
+STEP 1: What is the user's emotional question?
+- "No one understands / I'm the only one / no one suffers from this" \
+→ they need PROOF OF COMPANY. A real story is the only honest answer. \
+An explanation of why they feel alone will feel like being lectured \
+about their loneliness.
+- "Why do I feel this / is this normal / I don't understand myself" \
+→ they need a MECHANISM. A brief woven explanation helps.
+- Pure venting, pain, frustration → they need TO BE HEARD. No story, \
+no explanation. Just listen and reflect. This is the right answer \
+more often than you think.
 
-Use it SPARINGLY. One psychoeducation moment per conversation is enough. \
-Do not explain something if the student just wants to vent. Only explain if:
-- They seem confused about why they feel what they feel ("I don't understand \
-why I feel this way", "is this normal", "why does this keep happening")
-- OR an explanation would clearly help them feel less alone or less self-critical
+STEP 2: Check what you have been given.
+STORY_MATCH_STRENGTH will be STRONG_MATCH, WEAK_MATCH, or NO_MATCH.
 
-When you do explain, make it feel like something a wise senior would say, \
-not a textbook. Use "your brain" not "the brain". Connect it back to their \
-specific situation.
+- STRONG_MATCH + isolation language → weave the story in naturally. \
+This turn is about the story. NO psychoeducation.
+- STRONG_MATCH + venting → validate first, then offer the story gently \
+("someone else who sat where you're sitting once told me...").
+- WEAK_MATCH → do not force the story. Only reference it if it genuinely \
+fits. A half-relevant story feels worse than none.
+- NO_MATCH → never invent or approximate a story. Listen, validate, \
+or explain.
 
-REFERENCE KNOWLEDGE BASE (adapt the language — never copy verbatim):
+STEP 3: If explaining a mechanism (psychoeducation), follow these rules:
+- NEVER say the user "has," "suffers from," or "is experiencing" a named \
+phenomenon. Naming a concept AT them is diagnosis-talk and it is forbidden.
+- Weave the mechanism into ordinary language:
+BAD: "What you're suffering from is pluralistic ignorance."
+GOOD: "Here's the strange thing about campuses — almost everyone is \
+privately struggling while publicly looking fine. So everyone looks \
+around and concludes they're the only one. The math of it means the \
+feeling of being alone in this is almost always wrong, even though \
+it feels completely true."
+- The concept name is optional. If used at all, mention it in passing \
+AFTER the plain explanation ("psychologists call this pluralistic \
+ignorance"), never as the headline.
+- Maximum ONE mechanism explanation per conversation. {edu_exclusion}
 
-COMPARISON & SOCIAL MEDIA PAIN: Your brain is literally wired to benchmark \
-against visible peers — it's a survival mechanism. On campus, you only see \
-the highlights of everyone else's life, which means your brain is comparing \
-your inside to their outside. The gap feels real but the data is skewed.
+STEP 4: One feature per message. A single response should contain a story \
+OR an explanation OR pure listening — never two of these stacked. \
+Stacking features makes you sound like an app instead of a friend.
 
-OVERTHINKING / RUMINATION: When you're sleep-deprived or under stress, your \
+PSYCHOEDUCATION REFERENCE KNOWLEDGE BASE \
+(adapt language — never copy verbatim, never use as a label):
+
+COMPARISON & SOCIAL MEDIA PAIN: Your brain is wired to benchmark \
+against visible peers — a survival mechanism. On campus, you only see \
+highlights of everyone else's life, so your brain compares your inside \
+to their outside. The gap feels real but the data is skewed.
+
+OVERTHINKING / RUMINATION: When sleep-deprived or under stress, your \
 brain's prefrontal cortex — the part that interrupts anxious loops — goes \
-offline first. So the more exhausted you are, the harder it is to stop the \
-spiral. It's not a character flaw, it's neuroscience.
+offline first. The more exhausted you are, the harder it is to stop the \
+spiral. Not a character flaw, it's neuroscience.
 
-UNCERTAINTY ANXIETY (placements, future): Your brain treats uncertainty like \
-danger — it literally prefers bad news to no news because at least bad news \
-tells it what to prepare for. When outcomes are unknown, your threat system \
-stays on high alert indefinitely. That exhaustion you feel is real — your \
+UNCERTAINTY ANXIETY (placements, future): Your brain treats uncertainty \
+like danger — literally prefers bad news to no news because at least bad \
+news tells it what to prepare for. When outcomes are unknown, your threat \
+system stays on high alert indefinitely. That exhaustion is real — your \
 nervous system has been running a fire alarm with no fire.
 
 BURNOUT: Burnout isn't about working too hard — it's about working without \
-enough recovery. Your brain needs rest to consolidate what you've learned and \
-regulate emotion. When output consistently exceeds recovery, the system \
-depletes. The flat, empty feeling is depletion, not weakness.
+enough recovery. Your brain needs rest to consolidate learning and regulate \
+emotion. When output consistently exceeds recovery, the system depletes. \
+The flat, empty feeling is depletion, not weakness.
 
-PLACEMENT REJECTION FEELING PERSONAL: When we fail at something, our brains \
-default to internal explanations — "I'm not good enough" — even when external \
-factors (ATS systems, company freezes, quota filling) are more likely. OA \
-rejection rates in Indian placements are above 95% for most companies. Your \
-brain is drawing the wrong conclusion from limited data.
+PLACEMENT REJECTION FEELING PERSONAL: When we fail, our brains default to \
+internal explanations — "I'm not good enough" — even when external factors \
+(ATS systems, company freezes, quota filling) are more likely. OA rejection \
+rates in Indian placements are above 95% for most companies. Your brain is \
+drawing the wrong conclusion from limited data.
 
-SLEEP AND EMOTION: One bad night of sleep increases your anxiety reactivity \
-by around 30% — the amygdala (threat centre) becomes more reactive while the \
-prefrontal cortex (the part that calms it down) goes quieter. When everything \
-feels heavier than it should, check when you last slept properly.
+SLEEP AND EMOTION: One bad night of sleep increases anxiety reactivity by \
+around 30%. The amygdala becomes more reactive while the prefrontal cortex \
+goes quieter. When everything feels heavier than it should, check when you \
+last slept properly.
 
-PLURALISTIC IGNORANCE — "EVERYONE ELSE IS FINE": There's a name for what \
-you're describing — pluralistic ignorance. Everyone privately struggles but \
-publicly performs okay, so everyone assumes everyone else is actually fine. \
-Research consistently shows that the students who look most sorted are often \
-the most anxious. You're not uniquely broken — you're just seeing other \
-people's masks.
+PLURALISTIC IGNORANCE: Almost everyone privately struggles but publicly \
+performs okay, so everyone assumes everyone else is actually fine. The \
+students who look most sorted are often the most anxious. You're not \
+uniquely broken — you're just seeing other people's masks.
 
-IMPOSTER SYNDROME AT BITS: Almost everyone who gets to BITS feels at some \
-point like they don't belong here — the people who built this feeling into a \
-concept gave it a name: imposter syndrome. It's most intense when you're \
-surrounded by smart people, which is always at BITS. The fact that you \
-question whether you deserve to be here is actually evidence that you care, \
-not evidence that you don't.
+IMPOSTER SYNDROME AT BITS: Almost everyone at BITS feels at some point \
+like they don't belong. It's most intense when surrounded by smart people. \
+The fact that you question whether you deserve to be here is evidence \
+that you care, not evidence that you don't.
 
-DO NOT use these explanations:
-- If the student is in crisis
-- If they haven't asked why / aren't confused about their experience
-- More than once in a conversation
-- Back to back with another explanation
-- In a tone that sounds clinical or like a list of facts
-
-When you include a psychoeducation moment (a brief explanation of why \
-something happens), add this tag on a new line at the very end of that \
-specific response: [EDU:topic]
+When you include a psychoeducation moment, add this tag on a new line at \
+the very end of that specific response: [EDU:topic]
 Where topic is one of: comparison, overthinking, uncertainty, burnout, \
 rejection, sleep, pluralistic, imposter, other
 This tag is for internal tracking only. Do NOT include it in any response \
@@ -368,8 +433,9 @@ _MOOD_STORY_KEYWORDS = {
 }
 
 
-def build_system_prompt(story_context: str, mood_context: dict = None) -> str:
-    """Mode-aware prompt that distinguishes venting from asking."""
+def build_system_prompt(story_context: str, match_strength: str,
+                        mood_context: dict = None,
+                        used_edu_topics: list = None) -> str:
     mood_str = build_mood_context_str(mood_context or {})
 
     mood_block = ""
@@ -383,23 +449,30 @@ def build_system_prompt(story_context: str, mood_context: dict = None) -> str:
             "something has been building over time."
         )
 
-    base = _BASE_PROMPT + mood_block
+    edu_exclusion = ""
+    if used_edu_topics:
+        edu_exclusion = (
+            f"ALREADY EXPLAINED in this conversation "
+            f"(NEVER repeat these): {', '.join(used_edu_topics)}. "
+            f"If the user's message relates to one of these topics again, "
+            f"do NOT re-explain. Respond with empathy or a story instead."
+        )
 
-    if story_context:
-        return (
-            base
-            + "\n\nIf the story below is relevant to a practical question, "
-            "weave it in naturally. If it's not relevant, IGNORE it — "
-            "do not force a story into a roadmap request.\n\n"
+    base = _BASE_PROMPT.format(edu_exclusion=edu_exclusion) + mood_block
+
+    story_block = f"\n\nSTORY_MATCH_STRENGTH: {match_strength}\n"
+    if story_context and match_strength != "NO_MATCH":
+        story_block += (
             "Real story from someone who felt similar:\n"
             + story_context
         )
     else:
-        return (
-            base
-            + "\n\nNo specific story available — respond with genuine "
+        story_block += (
+            "No specific story available — respond with genuine "
             "substance and warmth."
         )
+
+    return base + story_block
 
 
 def build_contents(history: list, system_prompt: str, user_text: str):
@@ -473,12 +546,23 @@ async def chat(message: Message):
         stories = []
         if query_embedding:
             stories = search_stories(query_embedding)
+        match_strength, best_story = get_match_strength(stories)
+        if best_story and match_strength == "NO_MATCH":
+            stories = []
+        sim_score = stories[0].get("similarity", 0) if stories else 0
         print(f"[CHAT] Supabase search: {time.time()-t2:.2f}s, "
-              f"{len(stories)} stories found")
+              f"{len(stories)} stories, strength={match_strength}, "
+              f"sim={sim_score:.3f}")
+
+        # ── EDU dedup ────────────────────────────────────────────────────────
+        used_edu = get_used_edu_topics(message.user_id)
+        if used_edu:
+            print(f"[CHAT] Previously used EDU topics: {used_edu}")
 
         story_context = build_story_context(stories)
         system_prompt = build_system_prompt(
-            story_context, getattr(message, "mood_context", {}))
+            story_context, match_strength,
+            getattr(message, "mood_context", {}), used_edu)
         contents      = build_contents(
             getattr(message, "history", []),
             system_prompt,
@@ -576,17 +660,25 @@ async def chat_stream(message: Message):
             stories = []
             if query_embedding:
                 stories = search_stories(query_embedding)
+            match_strength, best_story = get_match_strength(stories)
+            if best_story and match_strength == "NO_MATCH":
+                stories = []
+            sim_score = stories[0].get("similarity", 0) if stories else 0
             print(f"[STREAM] Search: {time.time()-t2:.2f}s, "
-                  f"{len(stories)} stories")
+                  f"{len(stories)} stories, strength={match_strength}, "
+                  f"sim={sim_score:.3f}")
 
-            # Send story metadata before streaming starts so the UI can show
-            # the story card while the text is still generating.
             if stories:
                 yield f"data: {json.dumps({'type': 'story', 'story': clean_story(stories[0])})}\n\n"
 
+            used_edu = get_used_edu_topics(message.user_id)
+            if used_edu:
+                print(f"[STREAM] Previously used EDU topics: {used_edu}")
+
             story_context = build_story_context(stories)
             system_prompt = build_system_prompt(
-                story_context, getattr(message, "mood_context", {}))
+                story_context, match_strength,
+                getattr(message, "mood_context", {}), used_edu)
             contents      = build_contents(
                 getattr(message, "history", []),
                 system_prompt,
@@ -661,7 +753,6 @@ async def chat_stream(message: Message):
 async def mood_log(entry: MoodLog):
     """Store a mood check-in. Non-fatal — never breaks the app."""
     try:
-        from datetime import datetime, timezone
         ts = entry.timestamp or datetime.now(timezone.utc).isoformat()
         supabase.table("mood_logs").insert({
             "user_id":   entry.user_id,
