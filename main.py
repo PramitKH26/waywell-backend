@@ -167,7 +167,8 @@ def get_recent_state(user_id):
 
 
 def build_directives(user_text, match_strength,
-                     previous_response_tool, socratic_count_last_5):
+                     previous_response_tool, socratic_count_last_5,
+                     is_soft_concern=False):
     """Server-computed directives appended at the very END of the system
     prompt — last-instruction position holds most reliably."""
     directives = ""
@@ -197,6 +198,22 @@ def build_directives(user_text, match_strength,
             "Presence unless the user explicitly asks for deeper "
             "exploration. This conversation must not feel like an "
             "interview."
+        )
+
+    if is_soft_concern:
+        directives += (
+            "\n\nSOFT CONCERN DIRECTIVE:\n"
+            "The user used a phrase that could mean ordinary frustration "
+            "or could mean something heavier — you cannot tell which from "
+            "this message alone. For THIS response, after reflecting what "
+            "they said, ask directly and warmly what they meant. Do not "
+            "assume either direction. Do not surface helplines yet — this "
+            "is a clarifying question, not a crisis response. Example "
+            "tone: 'When you say you can't do this anymore — I want to "
+            "make sure I understand. Do you mean this specific thing "
+            "feels impossible right now, or does it feel bigger than "
+            "that?' Asking directly is the right thing to do here, not "
+            "an overreaction."
         )
 
     return directives
@@ -231,10 +248,29 @@ def is_crisis(text):
         "no point in anything anymore", "no point going on",
         "no point in living", "what's the point of any of this",
         "tired of being alive", "done with everything", "done with life",
-        "can't do this anymore",
     ]
     text_lower = text.lower()
     return any(word in text_lower for word in crisis_words)
+
+
+# Ambiguous phrases that could mean ordinary frustration ("can't do this
+# anymore" about an exam) or something heavier — too risky to ignore,
+# too broad to auto-escalate to the hard crisis protocol. Chai asks
+# directly instead of guessing either way.
+SOFT_CONCERN_PHRASES = [
+    "can't do this anymore",
+    "can't keep doing this",
+    "i'm so done",
+    "i can't handle this",
+    "i just can't anymore",
+    "i want to disappear",
+    "i wish i could just not exist for a while",
+]
+
+
+def detect_soft_concern(text: str) -> bool:
+    text_lower = text.lower()
+    return any(p in text_lower for p in SOFT_CONCERN_PHRASES)
 
 
 SOCRATIC_ANGLES = [
@@ -272,21 +308,23 @@ def is_avoidant_reply(text: str) -> bool:
 
 def _log_chat(user_id: str, message_length: int,
               was_crisis: bool, story_matched, edu_topic=None,
-              socratic_angle=None, response_tool=None):
+              socratic_angle=None, response_tool=None,
+              soft_concern_flag=False):
     """
     Privacy-safe usage log — stores ONLY metadata, NEVER message text.
     Failure is silently swallowed so it never breaks the chat.
     """
     try:
         supabase.table("chat_logs").insert({
-            "user_id":        user_id,
-            "message_length": message_length,
-            "was_crisis":     was_crisis,
-            "story_matched":  story_matched.get("author_name")
-                              if story_matched else None,
-            "edu_topic":      edu_topic,
-            "socratic_angle": socratic_angle,
-            "response_tool":  response_tool,
+            "user_id":           user_id,
+            "message_length":    message_length,
+            "was_crisis":        was_crisis,
+            "story_matched":     story_matched.get("author_name")
+                                 if story_matched else None,
+            "edu_topic":         edu_topic,
+            "socratic_angle":    socratic_angle,
+            "response_tool":     response_tool,
+            "soft_concern_flag": soft_concern_flag,
         }).execute()
     except Exception as e:
         print(f"[LOG] non-fatal logging error: {e}")
@@ -782,6 +820,11 @@ async def chat(message: Message):
                 "story":          None,
             }
 
+        # ── Soft-concern check (ambiguous phrasing, not hard crisis) ─────────
+        is_soft_concern = detect_soft_concern(message.text)
+        if is_soft_concern:
+            print(f"[CHAT] Soft-concern phrase detected")
+
         # ── Embedding ─────────────────────────────────────────────────────────
         t1 = time.time()
         query_embedding = get_embedding(message.text)
@@ -809,7 +852,8 @@ async def chat(message: Message):
                   f"recent_tools={recent_tools}")
 
         directives = build_directives(
-            message.text, match_strength, previous_tool, socratic_count)
+            message.text, match_strength, previous_tool, socratic_count,
+            is_soft_concern)
         if directives:
             active = re.findall(r'([A-Z-]+ DIRECTIVE)', directives)
             print(f"[CHAT] Directives active: {active}")
@@ -851,13 +895,15 @@ async def chat(message: Message):
         matched_story = clean_story(stories[0]) if stories else None
         print(f"[CHAT] TOTAL: {time.time()-t0:.2f}s")
         _log_chat(message.user_id, len(message.text), False,
-                  matched_story, edu_topic, socratic_angle, response_tool)
+                  matched_story, edu_topic, socratic_angle, response_tool,
+                  is_soft_concern)
 
         return {
-            "response":       reply_text,
-            "edu_topic":      edu_topic,
-            "socratic_angle": socratic_angle,
-            "response_tool":  response_tool,
+            "response":          reply_text,
+            "edu_topic":         edu_topic,
+            "socratic_angle":    socratic_angle,
+            "response_tool":     response_tool,
+            "soft_concern_flag": is_soft_concern,
             "is_crisis":      False,
             "story":          matched_story,
         }
@@ -911,6 +957,11 @@ async def chat_stream(message: Message):
                 yield "data: [DONE]\n\n"
                 return
 
+            # ── Soft-concern check (ambiguous phrasing, not hard crisis) ─────
+            is_soft_concern = detect_soft_concern(message.text)
+            if is_soft_concern:
+                print(f"[STREAM] Soft-concern phrase detected")
+
             # ── Embedding + story search ──────────────────────────────────────
             t1 = time.time()
             query_embedding = get_embedding(message.text)
@@ -940,7 +991,8 @@ async def chat_stream(message: Message):
                       f"angles={used_angles}, recent_tools={recent_tools}")
 
             directives = build_directives(
-                message.text, match_strength, previous_tool, socratic_count)
+                message.text, match_strength, previous_tool, socratic_count,
+                is_soft_concern)
             if directives:
                 active = re.findall(r'([A-Z-]+ DIRECTIVE)', directives)
                 print(f"[STREAM] Directives active: {active}")
@@ -993,8 +1045,9 @@ async def chat_stream(message: Message):
 
             matched_story = clean_story(stories[0]) if stories else None
             _log_chat(message.user_id, len(message.text), False,
-                      matched_story, edu_topic, socratic_angle, response_tool)
-            yield f"data: {json.dumps({'type': 'done', 'full_text': full_text, 'edu_topic': edu_topic, 'socratic_angle': socratic_angle, 'response_tool': response_tool})}\n\n"
+                      matched_story, edu_topic, socratic_angle, response_tool,
+                      is_soft_concern)
+            yield f"data: {json.dumps({'type': 'done', 'full_text': full_text, 'edu_topic': edu_topic, 'socratic_angle': socratic_angle, 'response_tool': response_tool, 'soft_concern_flag': is_soft_concern})}\n\n"
             yield "data: [DONE]\n\n"
 
         except Exception as e:
