@@ -129,21 +129,77 @@ def get_match_strength(stories):
     return "NO_MATCH", None
 
 
-def get_used_edu_topics(user_id):
+def get_recent_state(user_id):
+    """Pull per-user response history for prompt directives.
+    Returns (used_edu_topics, used_socratic_angles, recent_tools)
+    where recent_tools is the last 5 response tools, most recent first."""
+    used_topics, used_angles, recent_tools = [], [], []
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         result = supabase.table("chat_logs") \
-            .select("edu_topic") \
+            .select("edu_topic, socratic_angle") \
             .eq("user_id", user_id) \
             .gte("created_at", cutoff) \
             .execute()
-        return list(set(
-            r["edu_topic"] for r in (result.data or [])
-            if r.get("edu_topic")
-        ))
+        rows = result.data or []
+        used_topics = list(set(
+            r["edu_topic"] for r in rows if r.get("edu_topic")))
+        used_angles = list(set(
+            r["socratic_angle"] for r in rows if r.get("socratic_angle")))
     except Exception as e:
-        print(f"[EDU] Failed to query used topics: {e}")
-        return []
+        print(f"[STATE] 24h tag query failed: {e}")
+
+    try:
+        result = supabase.table("chat_logs") \
+            .select("response_tool, created_at") \
+            .eq("user_id", user_id) \
+            .order("created_at", desc=True) \
+            .limit(5) \
+            .execute()
+        recent_tools = [
+            r["response_tool"] for r in (result.data or [])
+            if r.get("response_tool")
+        ]
+    except Exception as e:
+        print(f"[STATE] recent tools query failed: {e}")
+
+    return used_topics, used_angles, recent_tools
+
+
+def build_directives(user_text, match_strength,
+                     previous_response_tool, socratic_count_last_5):
+    """Server-computed directives appended at the very END of the system
+    prompt — last-instruction position holds most reliably."""
+    directives = ""
+
+    if detect_isolation_language(user_text) and match_strength == "STRONG_MATCH":
+        directives += (
+            "\n\nISOLATION DIRECTIVE — OVERRIDES ALL OTHER MODE SELECTION:\n"
+            "The user expressed isolation and a strongly matching real "
+            "story is available. Mode MUST be Story. Do not use Socratic, "
+            "Presence, or Psychoeducation for this response."
+        )
+
+    if previous_response_tool == "socratic" and is_avoidant_reply(user_text):
+        directives += (
+            "\n\nLOOP-BREAK DIRECTIVE:\n"
+            "Your previous response asked a Socratic question. The user's "
+            "reply suggests they are not ready to explore further right "
+            "now. Do NOT ask another Socratic question. Switch to "
+            "Presence. Reflect gently. Do not push. Do not interrogate."
+        )
+
+    if socratic_count_last_5 >= 2:
+        directives += (
+            "\n\nQUESTION FATIGUE DIRECTIVE:\n"
+            "You have asked 2 or more Socratic questions in the last 5 "
+            "exchanges. Do NOT ask another Socratic question now. Choose "
+            "Presence unless the user explicitly asks for deeper "
+            "exploration. This conversation must not feel like an "
+            "interview."
+        )
+
+    return directives
 
 
 def clean_story(story):
@@ -172,8 +228,42 @@ def is_crisis(text):
     return any(word in text_lower for word in crisis_words)
 
 
+SOCRATIC_ANGLES = [
+    "evidence", "alternative", "origin", "consequence", "values",
+]
+
+RESPONSE_TOOLS = [
+    "presence", "story", "socratic", "psychoeducation", "crisis",
+]
+
+ISOLATION_PATTERNS = [
+    "no one", "nobody", "only one", "no one else",
+    "no one gets it", "no one understands",
+    "no one suffers", "everyone else is fine",
+    "am i the only", "i'm the only",
+    "no one else feels", "no one else has",
+]
+
+
+def detect_isolation_language(text: str) -> bool:
+    text_lower = text.lower()
+    return any(p in text_lower for p in ISOLATION_PATTERNS)
+
+
+def is_avoidant_reply(text: str) -> bool:
+    text_lower = text.lower().strip()
+    avoidant_phrases = [
+        "i don't know", "idk", "not sure",
+        "maybe", "i guess", "dunno", "no idea",
+    ]
+    word_count = len(text_lower.split())
+    has_avoidant = any(p in text_lower for p in avoidant_phrases)
+    return has_avoidant or word_count <= 6
+
+
 def _log_chat(user_id: str, message_length: int,
-              was_crisis: bool, story_matched, edu_topic=None):
+              was_crisis: bool, story_matched, edu_topic=None,
+              socratic_angle=None, response_tool=None):
     """
     Privacy-safe usage log — stores ONLY metadata, NEVER message text.
     Failure is silently swallowed so it never breaks the chat.
@@ -186,19 +276,28 @@ def _log_chat(user_id: str, message_length: int,
             "story_matched":  story_matched.get("author_name")
                               if story_matched else None,
             "edu_topic":      edu_topic,
+            "socratic_angle": socratic_angle,
+            "response_tool":  response_tool,
         }).execute()
     except Exception as e:
         print(f"[LOG] non-fatal logging error: {e}")
 
 
-def strip_edu_tag(text):
-    """Parse and strip the [EDU:topic] tag from Gemini's response."""
-    edu_match = re.search(r'\[EDU:(\w+)\]', text)
-    edu_topic = None
-    if edu_match:
-        edu_topic = edu_match.group(1)
-        text = re.sub(r'\[EDU:\w+\]', '', text).strip()
-    return text, edu_topic
+def strip_tags(text):
+    """Parse and strip [TOOL:x], [SOCRATIC:x], and [EDU:x] tags.
+    Returns (clean_text, edu_topic, socratic_angle, response_tool)."""
+    edu_match      = re.search(r'\[EDU:(\w+)\]', text)
+    socratic_match = re.search(r'\[SOCRATIC:(\w+)\]', text)
+    tool_match     = re.search(r'\[TOOL:(\w+)\]', text)
+
+    edu_topic      = edu_match.group(1)      if edu_match      else None
+    socratic_angle = socratic_match.group(1) if socratic_match else None
+    response_tool  = tool_match.group(1)     if tool_match     else None
+
+    # Safety pass — strips all three tag types including any duplicates
+    # or malformed extras the individual searches missed.
+    text = re.sub(r'\[(TOOL|SOCRATIC|EDU):\w+\]', '', text).strip()
+    return text, edu_topic, socratic_angle, response_tool
 
 
 def build_story_context(stories):
@@ -290,49 +389,113 @@ or "That's a great way to approach things"
 - Never describe their question back to them — they know what they asked
 - Maximum ONE question per response, and only in Mode 1 or when genuinely needed
 
-═══ RESPONSE SELECTION — decide what THIS message needs before writing ═══
+═══ RESPONSE POLICY ═══
 
-STEP 1: What is the user's emotional question?
-- "No one understands / I'm the only one / no one suffers from this" \
-→ they need PROOF OF COMPANY. A real story is the only honest answer. \
-An explanation of why they feel alone will feel like being lectured \
-about their loneliness.
-- "Why do I feel this / is this normal / I don't understand myself" \
-→ they need a MECHANISM. A brief woven explanation helps.
-- Pure venting, pain, frustration → they need TO BE HEARD. No story, \
-no explanation. Just listen and reflect. This is the right answer \
-more often than you think.
+Every response follows this exact sequence. This policy overrides \
+general instinct — follow it precisely.
 
-STEP 2: Check what you have been given.
-STORY_MATCH_STRENGTH will be STRONG_MATCH, WEAK_MATCH, or NO_MATCH.
+STEP 0 — REFLECTION (always, every message)
+Begin every response by reflecting the user's experience back to them \
+in fresh language that proves you understood the specific thing they \
+said. Never open with a generic line like "that sounds hard." \
+Paraphrase the actual content.
 
-- STRONG_MATCH + isolation language → weave the story in naturally. \
-This turn is about the story. NO psychoeducation.
-- STRONG_MATCH + venting → validate first, then offer the story gently \
-("someone else who sat where you're sitting once told me...").
-- WEAK_MATCH → do not force the story. Only reference it if it genuinely \
-fits. A half-relevant story feels worse than none.
-- NO_MATCH → never invent or approximate a story. Listen, validate, \
-or explain.
+Example:
+User: "I should be over this by now."
+Reflection: "It sounds like part of what hurts is feeling like you're \
+taking longer than you're 'allowed' to."
 
-STEP 3: If explaining a mechanism (psychoeducation), follow these rules:
-- NEVER say the user "has," "suffers from," or "is experiencing" a named \
-phenomenon. Naming a concept AT them is diagnosis-talk and it is forbidden.
-- Weave the mechanism into ordinary language:
-BAD: "What you're suffering from is pluralistic ignorance."
-GOOD: "Here's the strange thing about campuses — almost everyone is \
-privately struggling while publicly looking fine. So everyone looks \
-around and concludes they're the only one. The math of it means the \
-feeling of being alone in this is almost always wrong, even though \
-it feels completely true."
-- The concept name is optional. If used at all, mention it in passing \
-AFTER the plain explanation ("psychologists call this pluralistic \
-ignorance"), never as the headline.
-- Maximum ONE mechanism explanation per conversation. {edu_exclusion}
+STEP 1 — CHOOSE EXACTLY ONE MODE
+Never combine modes. Choose the highest-priority mode that applies. \
+Do not skip to a lower mode when a higher one applies.
 
-STEP 4: One feature per message. A single response should contain a story \
-OR an explanation OR pure listening — never two of these stacked. \
-Stacking features makes you sound like an app instead of a friend.
+PRIORITY ORDER (highest wins):
+1. Crisis
+2. Story
+3. Presence
+4. Socratic
+5. Psychoeducation
+
+── MODE 1: CRISIS ──
+Use existing crisis detection and protocol. Nothing about crisis \
+handling changes here.
+Tag: [TOOL:crisis]
+
+── MODE 2: STORY ──
+Use when BOTH are true: isolation language is present in the user's \
+message ("no one understands", "I'm the only one", "no one suffers \
+from this"), AND a STRONG_MATCH story is available. This is mandatory \
+when both conditions hold — not a judgment call. An explanation of why \
+someone feels alone is not equivalent to proof they are not alone; \
+only a real story provides that proof. Weave the story in naturally \
+after your reflection. Do not also ask a Socratic question or explain \
+a mechanism in this response.
+Tag: [TOOL:story]
+
+── MODE 3: PRESENCE ──
+Use when ANY of these are true:
+- the user is in acute emotional pain
+- the user is mainly venting, not asking anything
+- the user just gave a short or avoidant reply following a Socratic \
+question (see LOOP-BREAK DIRECTIVE if present below)
+- the conversation has already had 2+ Socratic questions in the last \
+5 exchanges (see QUESTION FATIGUE DIRECTIVE if present below)
+- the user seems emotionally flooded, not in a reflective state
+Presence means: reflect, validate, stay with them, optionally invite \
+them to keep talking. Do not push toward insight. Do not ask a probing \
+question. Sitting with someone without trying to fix or explain \
+anything is often the correct and complete response — not a fallback.
+Tag: [TOOL:presence]
+
+── MODE 4: SOCRATIC QUESTION ──
+Use ONLY when the user expresses a belief, prediction, self-judgment, \
+assumption, or interpretation about themselves or their situation.
+Examples that DO qualify: "I'm broken." "Nobody likes me." "Everyone \
+can tell I'm failing." "I should be over this."
+Examples that do NOT qualify — objective events with no embedded \
+belief to examine: "My dog died." "I failed my exam." Do not turn a \
+factual loss or event into an interrogation.
+
+Ask exactly ONE open-ended question. Do not answer it yourself. \
+Choose exactly ONE angle from the list below and tag it:
+
+  evidence: "What evidence makes you feel that's true?"
+  alternative: "Is there another way to see this?"
+  origin: "When did you first start believing this about yourself?"
+  consequence: "What would you say to someone you cared about if they \
+believed this about themselves?"
+  values: "What matters most to you underneath this?"
+
+{socratic_exclusion}
+If all five angles have been used recently, prefer Presence instead.
+Tag: [TOOL:socratic] and [SOCRATIC:angle]
+
+── MODE 5: PSYCHOEDUCATION ──
+Use ONLY when: the user directly asks "why do I feel this" or "is this \
+normal" or equivalent, AND no Story applies, AND no Crisis applies, \
+AND Presence conditions don't apply, AND the topic hasn't been \
+explained in the last 24h. {edu_exclusion}
+
+Before explaining, ask permission naturally within the same response — \
+do not wait for a separate reply. Example transition: "Can I share \
+something that might help explain this?" Then continue directly into \
+a 2-3 sentence explanation. Weave it into plain, warm language. \
+Never say the user "has," "suffers from," or "is experiencing" a named \
+phenomenon — that is diagnosis-talk and is forbidden. The concept \
+name, if used at all, comes after the plain explanation, never as \
+the headline.
+Tag: [TOOL:psychoeducation] and [EDU:topic]
+
+STEP 2 — NEVER STACK MODES
+One response. One mode. No exceptions. If you notice yourself about \
+to use two tools in one response, drop the lower-priority one.
+
+TAGGING (mandatory, internal only):
+Every response MUST end with its [TOOL:name] tag on a new line, where \
+name is one of: presence, story, socratic, psychoeducation, crisis. \
+Add [SOCRATIC:angle] alongside it for Socratic responses, and \
+[EDU:topic] for Psychoeducation responses. These tags are stripped \
+before the user sees the message — never reference them in prose.
 
 PSYCHOEDUCATION REFERENCE KNOWLEDGE BASE \
 (adapt language — never copy verbatim, never use as a label):
@@ -435,7 +598,9 @@ _MOOD_STORY_KEYWORDS = {
 
 def build_system_prompt(story_context: str, match_strength: str,
                         mood_context: dict = None,
-                        used_edu_topics: list = None) -> str:
+                        used_edu_topics: list = None,
+                        used_socratic_angles: list = None,
+                        directives: str = "") -> str:
     mood_str = build_mood_context_str(mood_context or {})
 
     mood_block = ""
@@ -452,13 +617,21 @@ def build_system_prompt(story_context: str, match_strength: str,
     edu_exclusion = ""
     if used_edu_topics:
         edu_exclusion = (
-            f"ALREADY EXPLAINED in this conversation "
-            f"(NEVER repeat these): {', '.join(used_edu_topics)}. "
-            f"If the user's message relates to one of these topics again, "
-            f"do NOT re-explain. Respond with empathy or a story instead."
+            f"ALREADY EXPLAINED in the last 24h "
+            f"(never repeat): {', '.join(used_edu_topics)}."
         )
 
-    base = _BASE_PROMPT.format(edu_exclusion=edu_exclusion) + mood_block
+    socratic_exclusion = ""
+    if used_socratic_angles:
+        socratic_exclusion = (
+            f"SOCRATIC ANGLES ALREADY USED in the last 24h: "
+            f"{', '.join(used_socratic_angles)}. Avoid repeating them."
+        )
+
+    base = _BASE_PROMPT.format(
+        edu_exclusion=edu_exclusion,
+        socratic_exclusion=socratic_exclusion,
+    ) + mood_block
 
     story_block = f"\n\nSTORY_MATCH_STRENGTH: {match_strength}\n"
     if story_context and match_strength != "NO_MATCH":
@@ -472,7 +645,8 @@ def build_system_prompt(story_context: str, match_strength: str,
             "substance and warmth."
         )
 
-    return base + story_block
+    # Directives go LAST — last-instruction position holds most reliably.
+    return base + story_block + directives
 
 
 def build_contents(history: list, system_prompt: str, user_text: str):
@@ -521,7 +695,8 @@ async def chat(message: Message):
         # ── Crisis check (fast path, no LLM needed) ──────────────────────────
         if is_crisis(message.text):
             print(f"[CHAT] Crisis path, total: {time.time()-t0:.2f}s")
-            _log_chat(message.user_id, len(message.text), True, None)
+            _log_chat(message.user_id, len(message.text), True, None,
+                      response_tool="crisis")
             return {
                 "response": (
                     "It sounds like things feel very heavy right now. "
@@ -532,8 +707,11 @@ async def chat(message: Message):
                     "Vandrevala": "1860-2662-345",
                     "KIRAN":      "1800-599-0019",
                 },
-                "is_crisis": True,
-                "story": None,
+                "is_crisis":      True,
+                "response_tool":  "crisis",
+                "edu_topic":      None,
+                "socratic_angle": None,
+                "story":          None,
             }
 
         # ── Embedding ─────────────────────────────────────────────────────────
@@ -554,15 +732,25 @@ async def chat(message: Message):
               f"{len(stories)} stories, strength={match_strength}, "
               f"sim={sim_score:.3f}")
 
-        # ── EDU dedup ────────────────────────────────────────────────────────
-        used_edu = get_used_edu_topics(message.user_id)
-        if used_edu:
-            print(f"[CHAT] Previously used EDU topics: {used_edu}")
+        # ── Per-user state → exclusions + directives ─────────────────────────
+        used_edu, used_angles, recent_tools = get_recent_state(message.user_id)
+        previous_tool = recent_tools[0] if recent_tools else None
+        socratic_count = recent_tools.count("socratic")
+        if used_edu or used_angles or recent_tools:
+            print(f"[CHAT] State: edu={used_edu}, angles={used_angles}, "
+                  f"recent_tools={recent_tools}")
+
+        directives = build_directives(
+            message.text, match_strength, previous_tool, socratic_count)
+        if directives:
+            active = re.findall(r'([A-Z-]+ DIRECTIVE)', directives)
+            print(f"[CHAT] Directives active: {active}")
 
         story_context = build_story_context(stories)
         system_prompt = build_system_prompt(
             story_context, match_strength,
-            getattr(message, "mood_context", {}), used_edu)
+            getattr(message, "mood_context", {}),
+            used_edu, used_angles, directives)
         contents      = build_contents(
             getattr(message, "history", []),
             system_prompt,
@@ -587,20 +775,23 @@ async def chat(message: Message):
                 "I'm still here."
             )
 
-        reply_text, edu_topic = strip_edu_tag(reply_text)
-        if edu_topic:
-            print(f"[CHAT] EDU tag: {edu_topic}")
+        reply_text, edu_topic, socratic_angle, response_tool = \
+            strip_tags(reply_text)
+        print(f"[CHAT] Tags: tool={response_tool}, "
+              f"socratic={socratic_angle}, edu={edu_topic}")
 
         matched_story = clean_story(stories[0]) if stories else None
         print(f"[CHAT] TOTAL: {time.time()-t0:.2f}s")
         _log_chat(message.user_id, len(message.text), False,
-                  matched_story, edu_topic)
+                  matched_story, edu_topic, socratic_angle, response_tool)
 
         return {
-            "response":  reply_text,
-            "edu_topic": edu_topic,
-            "is_crisis": False,
-            "story":     matched_story,
+            "response":       reply_text,
+            "edu_topic":      edu_topic,
+            "socratic_angle": socratic_angle,
+            "response_tool":  response_tool,
+            "is_crisis":      False,
+            "story":          matched_story,
         }
 
     except Exception as e:
@@ -646,8 +837,9 @@ async def chat_stream(message: Message):
         try:
             # ── Crisis check ─────────────────────────────────────────────────
             if is_crisis(message.text):
-                _log_chat(message.user_id, len(message.text), True, None)
-                yield f"data: {json.dumps({'type': 'crisis', 'response': 'It sounds like things feel very heavy right now. Please reach out to someone who can help immediately.', 'is_crisis': True, 'helplines': {'iCall': '9152987821', 'Vandrevala': '1860-2662-345', 'KIRAN': '1800-599-0019'}})}\n\n"
+                _log_chat(message.user_id, len(message.text), True, None,
+                          response_tool="crisis")
+                yield f"data: {json.dumps({'type': 'crisis', 'response': 'It sounds like things feel very heavy right now. Please reach out to someone who can help immediately.', 'is_crisis': True, 'response_tool': 'crisis', 'helplines': {'iCall': '9152987821', 'Vandrevala': '1860-2662-345', 'KIRAN': '1800-599-0019'}})}\n\n"
                 yield "data: [DONE]\n\n"
                 return
 
@@ -671,14 +863,25 @@ async def chat_stream(message: Message):
             if stories:
                 yield f"data: {json.dumps({'type': 'story', 'story': clean_story(stories[0])})}\n\n"
 
-            used_edu = get_used_edu_topics(message.user_id)
-            if used_edu:
-                print(f"[STREAM] Previously used EDU topics: {used_edu}")
+            used_edu, used_angles, recent_tools = \
+                get_recent_state(message.user_id)
+            previous_tool = recent_tools[0] if recent_tools else None
+            socratic_count = recent_tools.count("socratic")
+            if used_edu or used_angles or recent_tools:
+                print(f"[STREAM] State: edu={used_edu}, "
+                      f"angles={used_angles}, recent_tools={recent_tools}")
+
+            directives = build_directives(
+                message.text, match_strength, previous_tool, socratic_count)
+            if directives:
+                active = re.findall(r'([A-Z-]+ DIRECTIVE)', directives)
+                print(f"[STREAM] Directives active: {active}")
 
             story_context = build_story_context(stories)
             system_prompt = build_system_prompt(
                 story_context, match_strength,
-                getattr(message, "mood_context", {}), used_edu)
+                getattr(message, "mood_context", {}),
+                used_edu, used_angles, directives)
             contents      = build_contents(
                 getattr(message, "history", []),
                 system_prompt,
@@ -715,14 +918,15 @@ async def chat_stream(message: Message):
                   f"{len(full_text)} chars")
             print(f"[STREAM] TOTAL: {time.time()-t0:.2f}s")
 
-            full_text, edu_topic = strip_edu_tag(full_text)
-            if edu_topic:
-                print(f"[STREAM] EDU tag: {edu_topic}")
+            full_text, edu_topic, socratic_angle, response_tool = \
+                strip_tags(full_text)
+            print(f"[STREAM] Tags: tool={response_tool}, "
+                  f"socratic={socratic_angle}, edu={edu_topic}")
 
             matched_story = clean_story(stories[0]) if stories else None
             _log_chat(message.user_id, len(message.text), False,
-                      matched_story, edu_topic)
-            yield f"data: {json.dumps({'type': 'done', 'full_text': full_text, 'edu_topic': edu_topic})}\n\n"
+                      matched_story, edu_topic, socratic_angle, response_tool)
+            yield f"data: {json.dumps({'type': 'done', 'full_text': full_text, 'edu_topic': edu_topic, 'socratic_angle': socratic_angle, 'response_tool': response_tool})}\n\n"
             yield "data: [DONE]\n\n"
 
         except Exception as e:
