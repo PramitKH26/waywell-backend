@@ -309,7 +309,7 @@ def is_avoidant_reply(text: str) -> bool:
 def _log_chat(user_id: str, message_length: int,
               was_crisis: bool, story_matched, edu_topic=None,
               socratic_angle=None, response_tool=None,
-              soft_concern_flag=False):
+              soft_concern_flag=False, tag_downgraded=False):
     """
     Privacy-safe usage log — stores ONLY metadata, NEVER message text.
     Failure is silently swallowed so it never breaks the chat.
@@ -325,6 +325,7 @@ def _log_chat(user_id: str, message_length: int,
             "socratic_angle":    socratic_angle,
             "response_tool":     response_tool,
             "soft_concern_flag": soft_concern_flag,
+            "tag_downgraded":    tag_downgraded,
         }).execute()
     except Exception as e:
         print(f"[LOG] non-fatal logging error: {e}")
@@ -345,6 +346,28 @@ def strip_tags(text):
     # or malformed extras the individual searches missed.
     text = re.sub(r'\[(TOOL|SOCRATIC|EDU):\w+\]', '', text).strip()
     return text, edu_topic, socratic_angle, response_tool
+
+
+def validate_socratic_tag(response_tool, socratic_angle, response_text):
+    """
+    Confirms a response tagged as socratic actually contains a question.
+    If not, downgrades to presence and clears the angle, so it never
+    pollutes exclusion lists or the fatigue counter.
+
+    Returns (corrected_tool, corrected_angle)
+    """
+    if response_tool != "socratic":
+        return response_tool, socratic_angle
+
+    stripped = response_text.strip()
+    has_question_mark = "?" in stripped
+
+    if not has_question_mark:
+        print(f"[TAG VALIDATION] Downgraded socratic->presence, no '?' "
+              f"found in response: {stripped[:80]}...")
+        return "presence", None
+
+    return response_tool, socratic_angle
 
 
 def build_story_context(stories):
@@ -892,11 +915,17 @@ async def chat(message: Message):
         print(f"[CHAT] Tags: tool={response_tool}, "
               f"socratic={socratic_angle}, edu={edu_topic}")
 
+        original_tool = response_tool
+        response_tool, socratic_angle = validate_socratic_tag(
+            response_tool, socratic_angle, reply_text)
+        tag_downgraded = (original_tool == "socratic"
+                          and response_tool == "presence")
+
         matched_story = clean_story(stories[0]) if stories else None
         print(f"[CHAT] TOTAL: {time.time()-t0:.2f}s")
         _log_chat(message.user_id, len(message.text), False,
                   matched_story, edu_topic, socratic_angle, response_tool,
-                  is_soft_concern)
+                  is_soft_concern, tag_downgraded)
 
         return {
             "response":          reply_text,
@@ -1043,10 +1072,16 @@ async def chat_stream(message: Message):
             print(f"[STREAM] Tags: tool={response_tool}, "
                   f"socratic={socratic_angle}, edu={edu_topic}")
 
+            original_tool = response_tool
+            response_tool, socratic_angle = validate_socratic_tag(
+                response_tool, socratic_angle, full_text)
+            tag_downgraded = (original_tool == "socratic"
+                              and response_tool == "presence")
+
             matched_story = clean_story(stories[0]) if stories else None
             _log_chat(message.user_id, len(message.text), False,
                       matched_story, edu_topic, socratic_angle, response_tool,
-                      is_soft_concern)
+                      is_soft_concern, tag_downgraded)
             yield f"data: {json.dumps({'type': 'done', 'full_text': full_text, 'edu_topic': edu_topic, 'socratic_angle': socratic_angle, 'response_tool': response_tool, 'soft_concern_flag': is_soft_concern})}\n\n"
             yield "data: [DONE]\n\n"
 
