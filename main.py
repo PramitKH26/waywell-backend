@@ -33,6 +33,7 @@ class Message(BaseModel):
     history: list = []          # list of {role: 'user'|'assistant', content: '...'}
     user_id: str = "anonymous"  # anonymous UUID from IdentityService
     mood_context: dict = {}     # {current_mood, recent_moods}
+    user_context: dict = {}     # {user_name, mood_trends, days_using_app}
 
 class MoodLog(BaseModel):
     user_id: str = "anonymous"
@@ -49,6 +50,12 @@ class MoodReflection(BaseModel):
     user_id: str = "anonymous"
     before_mood: str
     after_reflection: str
+
+class Feedback(BaseModel):
+    user_id: str = "anonymous"
+    category: str  # 'bug', 'suggestion', 'story', 'other'
+    message: str
+    app_version: str = ""
 
 
 # ----------------------------
@@ -715,6 +722,42 @@ def build_mood_context_str(mood_context: dict) -> str:
     return "\n".join(parts)
 
 
+def build_context_block(user_context: dict) -> str:
+    if not user_context:
+        return ""
+    parts = []
+    name = user_context.get("user_name")
+    if name:
+        parts.append(
+            f"The student's name is {name}. Use it occasionally and "
+            "naturally — not every response, just when it adds warmth."
+        )
+    trends = user_context.get("mood_trends", [])
+    if len(trends) >= 3:
+        trend_str = ", ".join(trends[:7])
+        parts.append(f"Recent mood pattern (newest first): {trend_str}")
+    days = user_context.get("days_using_app")
+    if days is not None:
+        if days <= 1:
+            parts.append(
+                "This student just started using the app today. "
+                "Be extra welcoming and warm."
+            )
+        elif days <= 7:
+            parts.append(
+                f"This student has been using the app for {days} days. "
+                "Still building trust — lean warmer."
+            )
+        elif days > 14:
+            parts.append(
+                f"This student has been using the app for {days} days. "
+                "You know each other well — be direct and natural."
+            )
+    if not parts:
+        return ""
+    return "\n\n═══ USER CONTEXT ═══\n" + "\n".join(parts)
+
+
 _MOOD_STORY_KEYWORDS = {
     "Overwhelmed": ["pressure", "overwhelmed", "stress", "burnout", "too much"],
     "Stressed":    ["stress", "anxiety", "placement", "exam", "deadline"],
@@ -727,6 +770,7 @@ _MOOD_STORY_KEYWORDS = {
 
 def build_system_prompt(story_context: str, match_strength: str,
                         mood_context: dict = None,
+                        user_context: dict = None,
                         used_edu_topics: list = None,
                         used_socratic_angles: list = None,
                         directives: str = "") -> str:
@@ -757,10 +801,12 @@ def build_system_prompt(story_context: str, match_strength: str,
             f"{', '.join(used_socratic_angles)}. Avoid repeating them."
         )
 
+    context_block = build_context_block(user_context or {})
+
     base = _BASE_PROMPT.format(
         edu_exclusion=edu_exclusion,
         socratic_exclusion=socratic_exclusion,
-    ) + mood_block
+    ) + mood_block + context_block
 
     story_block = f"\n\nSTORY_MATCH_STRENGTH: {match_strength}\n"
     if story_context and match_strength != "NO_MATCH":
@@ -885,6 +931,7 @@ async def chat(message: Message):
         system_prompt = build_system_prompt(
             story_context, match_strength,
             getattr(message, "mood_context", {}),
+            getattr(message, "user_context", {}),
             used_edu, used_angles, directives)
         contents      = build_contents(
             getattr(message, "history", []),
@@ -1030,6 +1077,7 @@ async def chat_stream(message: Message):
             system_prompt = build_system_prompt(
                 story_context, match_strength,
                 getattr(message, "mood_context", {}),
+                getattr(message, "user_context", {}),
                 used_edu, used_angles, directives)
             contents      = build_contents(
                 getattr(message, "history", []),
@@ -1154,3 +1202,23 @@ async def mood_reflection(entry: MoodReflection):
     except Exception as e:
         print(f"[MOOD REFLECTION] non-fatal: {e}")
         return {"ok": False}
+
+
+# ----------------------------
+# FEEDBACK ENDPOINT
+# ----------------------------
+@app.post("/feedback")
+async def submit_feedback(feedback: Feedback):
+    if not feedback.message.strip():
+        return {"error": "Message required"}
+    try:
+        supabase.table("feedback").insert({
+            "user_id":     feedback.user_id,
+            "category":    feedback.category,
+            "message":     feedback.message,
+            "app_version": feedback.app_version,
+        }).execute()
+        return {"success": True}
+    except Exception as e:
+        print(f"[FEEDBACK] Error: {e}")
+        return {"success": False}
