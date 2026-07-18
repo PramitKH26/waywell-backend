@@ -3,3 +3,5 @@ uvicorn
 google-genai
 supabase
 python-dotenv
+google-auth>=2.48.1
+aiohttp==3.10.10

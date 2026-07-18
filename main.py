@@ -11,6 +11,9 @@ import google.genai as genai
 from supabase import create_client
 import os
 from dotenv import load_dotenv
+import aiohttp
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request as GRequest
 
 # Load environment variables
 load_dotenv()
@@ -25,6 +28,16 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 supabase = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_KEY")
+)
+
+# Service-role client — bypasses RLS. Used only for tables locked to
+# backend-only access (user_profiles, friend_connections). Falls back to
+# the anon client if the service key isn't configured yet, so the app
+# doesn't crash before Railway env vars are set — those endpoints will
+# just fail closed (RLS blocks anon) until SUPABASE_SERVICE_KEY exists.
+supabase_admin = create_client(
+    os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
 )
 
 # Request models
@@ -56,6 +69,31 @@ class Feedback(BaseModel):
     category: str  # 'bug', 'suggestion', 'story', 'other'
     message: str
     app_version: str = ""
+
+class ProfileCreate(BaseModel):
+    device_user_id: str
+    username: str
+    display_name: str = ""
+
+class FcmTokenUpdate(BaseModel):
+    device_user_id: str
+    token: str
+
+class FriendRequestBody(BaseModel):
+    requester_id: str
+    recipient_username: str
+
+class FriendRespondBody(BaseModel):
+    connection_id: str
+    accept: bool
+    as_safety_contact: bool = False
+
+class FriendToggleSafetyBody(BaseModel):
+    connection_id: str
+    is_safety_contact: bool
+
+class SafetyAlertBody(BaseModel):
+    user_id: str
 
 
 # ----------------------------
@@ -1222,3 +1260,240 @@ async def submit_feedback(feedback: Feedback):
     except Exception as e:
         print(f"[FEEDBACK] Error: {e}")
         return {"success": False}
+
+
+# ----------------------------
+# FRIENDS SYSTEM — profiles, connections, safety alerts
+#
+# All reads/writes go through supabase_admin (service_role), never the
+# client. user_profiles and friend_connections have RLS locked to
+# backend-only access.
+# ----------------------------
+
+def is_valid_username(u: str) -> bool:
+    return bool(re.match(r'^[a-z0-9_]{3,20}$', u.strip().lower()))
+
+
+@app.post("/profile/create")
+async def create_profile(body: ProfileCreate):
+    if not is_valid_username(body.username):
+        return {"error": "Username must be 3-20 chars, lowercase "
+                          "letters, numbers, underscore only"}
+    try:
+        supabase_admin.table("user_profiles").insert({
+            "device_user_id": body.device_user_id,
+            "username":       body.username.strip().lower(),
+            "display_name":   body.display_name,
+        }).execute()
+        return {"success": True}
+    except Exception as e:
+        if "duplicate" in str(e).lower():
+            return {"error": "Username taken"}
+        print(f"[PROFILE CREATE] Error: {e}")
+        return {"error": "Could not create profile"}
+
+
+@app.post("/profile/fcm-token")
+async def update_fcm_token(body: FcmTokenUpdate):
+    try:
+        supabase_admin.table("user_profiles").update({
+            "fcm_token":  body.token,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("device_user_id", body.device_user_id).execute()
+        return {"success": True}
+    except Exception as e:
+        print(f"[FCM TOKEN] Error: {e}")
+        return {"success": False}
+
+
+@app.get("/users/search")
+async def search_username(username: str):
+    result = supabase_admin.table("user_profiles") \
+        .select("username, display_name, device_user_id") \
+        .eq("username", username.strip().lower()) \
+        .execute()
+    if not result.data:
+        return {"found": False}
+    r = result.data[0]
+    return {
+        "found":        True,
+        "username":     r["username"],
+        "display_name": r.get("display_name"),
+    }
+
+
+@app.post("/friends/request")
+async def send_request(body: FriendRequestBody):
+    if not is_valid_username(body.recipient_username):
+        return {"error": "Invalid username"}
+    recipient = supabase_admin.table("user_profiles") \
+        .select("device_user_id") \
+        .eq("username", body.recipient_username.strip().lower()) \
+        .execute()
+    if not recipient.data:
+        return {"error": "User not found"}
+    rec_id = recipient.data[0]["device_user_id"]
+    if rec_id == body.requester_id:
+        return {"error": "Cannot friend yourself"}
+    try:
+        supabase_admin.table("friend_connections").insert({
+            "requester_id": body.requester_id,
+            "recipient_id": rec_id,
+            "status":       "pending",
+        }).execute()
+        return {"success": True}
+    except Exception as e:
+        if "duplicate" in str(e).lower():
+            return {"error": "Request already exists"}
+        print(f"[FRIEND REQUEST] Error: {e}")
+        return {"error": "Could not send request"}
+
+
+@app.get("/friends/list/{user_id}")
+async def list_friends(user_id: str):
+    result = supabase_admin.table("friend_connections") \
+        .select("*") \
+        .or_(f"requester_id.eq.{user_id},recipient_id.eq.{user_id}") \
+        .execute()
+    friends = []
+    pending_incoming = []
+    for row in result.data:
+        other_id = (row["recipient_id"]
+                    if row["requester_id"] == user_id
+                    else row["requester_id"])
+        prof = supabase_admin.table("user_profiles") \
+            .select("username, display_name") \
+            .eq("device_user_id", other_id) \
+            .execute()
+        if not prof.data:
+            continue
+        entry = {
+            "connection_id":    row["id"],
+            "username":         prof.data[0]["username"],
+            "display_name":     prof.data[0].get("display_name"),
+            "status":           row["status"],
+            "is_safety_contact": row["is_safety_contact"],
+        }
+        if row["status"] == "pending" and row["recipient_id"] == user_id:
+            pending_incoming.append(entry)
+        elif row["status"] == "accepted":
+            friends.append(entry)
+    return {
+        "friends":          friends,
+        "pending_incoming": pending_incoming,
+    }
+
+
+@app.post("/friends/respond")
+async def respond(body: FriendRespondBody):
+    try:
+        supabase_admin.table("friend_connections").update({
+            "status": "accepted" if body.accept else "declined",
+            "is_safety_contact":
+                body.as_safety_contact if body.accept else False,
+            "responded_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", body.connection_id).execute()
+        return {"success": True}
+    except Exception as e:
+        print(f"[FRIEND RESPOND] Error: {e}")
+        return {"success": False}
+
+
+@app.post("/friends/toggle-safety")
+async def toggle_safety(body: FriendToggleSafetyBody):
+    try:
+        supabase_admin.table("friend_connections").update({
+            "is_safety_contact": body.is_safety_contact,
+        }).eq("id", body.connection_id).execute()
+        return {"success": True}
+    except Exception as e:
+        print(f"[TOGGLE SAFETY] Error: {e}")
+        return {"success": False}
+
+
+async def send_fcm(token: str, title: str, body: str) -> bool:
+    """Sends a push via FCM HTTP v1 API. Returns False (never raises) if
+    FCM_SERVICE_ACCOUNT isn't configured yet or the send fails."""
+    try:
+        raw = os.environ.get("FCM_SERVICE_ACCOUNT")
+        if not raw:
+            print("[FCM] FCM_SERVICE_ACCOUNT not set — skipping send")
+            return False
+        creds_json = json.loads(raw)
+        creds = service_account.Credentials.from_service_account_info(
+            creds_json,
+            scopes=["https://www.googleapis.com/auth/firebase.messaging"],
+        )
+        creds.refresh(GRequest())
+        project_id = creds_json["project_id"]
+        url = (f"https://fcm.googleapis.com/v1/"
+               f"projects/{project_id}/messages:send")
+        payload = {
+            "message": {
+                "token": token,
+                "notification": {
+                    "title": title,
+                    "body":  body,
+                },
+                "android": {
+                    "priority": "high",
+                    "notification": {
+                        "channel_id": "waywell_safety_alerts",
+                    },
+                },
+            }
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {creds.token}",
+                    "Content-Type":  "application/json",
+                },
+                json=payload,
+            ) as resp:
+                return resp.status == 200
+    except Exception as e:
+        print(f"[FCM] Error: {e}")
+        return False
+
+
+@app.post("/safety-alert/send")
+async def send_alert(body: SafetyAlertBody):
+    user_id = body.user_id
+    prof = supabase_admin.table("user_profiles") \
+        .select("username, display_name") \
+        .eq("device_user_id", user_id) \
+        .execute()
+    if not prof.data:
+        return {"alerted": 0}
+    sender_name = prof.data[0].get("display_name") or prof.data[0]["username"]
+
+    contacts = supabase_admin.table("friend_connections") \
+        .select("*") \
+        .or_(f"requester_id.eq.{user_id},recipient_id.eq.{user_id}") \
+        .eq("status", "accepted") \
+        .eq("is_safety_contact", True) \
+        .execute()
+
+    alerted = 0
+    for c in contacts.data:
+        other_id = (c["recipient_id"]
+                    if c["requester_id"] == user_id
+                    else c["requester_id"])
+        other_prof = supabase_admin.table("user_profiles") \
+            .select("fcm_token") \
+            .eq("device_user_id", other_id) \
+            .execute()
+        if not other_prof.data or not other_prof.data[0].get("fcm_token"):
+            continue
+        token = other_prof.data[0]["fcm_token"]
+        success = await send_fcm(
+            token=token,
+            title=f"{sender_name} might need support",
+            body="A friend on Waywell reached out. Consider checking in "
+                 "on them.",
+        )
+        if success:
+            alerted += 1
+    return {"alerted": alerted}
