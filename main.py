@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -367,6 +368,38 @@ def is_avoidant_reply(text: str) -> bool:
     return has_avoidant or word_count <= 6
 
 
+def _track_feature(device_user_id: str, feature: str):
+    """
+    Beta-measurement helper — marks a feature as used and stamps
+    signup_at/first_action on first-ever activity for this device.
+    Creates a minimal user_profiles row if one doesn't exist yet, so
+    anonymous users (no username set) are still counted for retention.
+    Non-fatal — never breaks the caller.
+    """
+    if not device_user_id:
+        return
+    try:
+        flag_col = f"has_used_{feature}"
+        existing = supabase_admin.table("user_profiles") \
+            .select("device_user_id, first_action") \
+            .eq("device_user_id", device_user_id).execute()
+        if existing.data:
+            update = {flag_col: True}
+            if not existing.data[0].get("first_action"):
+                update["first_action"] = feature
+            supabase_admin.table("user_profiles").update(update) \
+                .eq("device_user_id", device_user_id).execute()
+        else:
+            supabase_admin.table("user_profiles").insert({
+                "device_user_id": device_user_id,
+                "signup_at":      datetime.now(timezone.utc).isoformat(),
+                "first_action":   feature,
+                flag_col:         True,
+            }).execute()
+    except Exception as e:
+        print(f"[TRACK] non-fatal ({feature}): {e}")
+
+
 def _log_chat(user_id: str, message_length: int,
               was_crisis: bool, story_matched, edu_topic=None,
               socratic_angle=None, response_tool=None,
@@ -375,6 +408,7 @@ def _log_chat(user_id: str, message_length: int,
     Privacy-safe usage log — stores ONLY metadata, NEVER message text.
     Failure is silently swallowed so it never breaks the chat.
     """
+    _track_feature(user_id, "chai")
     try:
         supabase.table("chat_logs").insert({
             "user_id":           user_id,
@@ -1222,6 +1256,7 @@ async def mood_log(entry: MoodLog):
             "source":    entry.source,
             "logged_at": ts,
         }).execute()
+        _track_feature(entry.user_id, "mood")
         return {"ok": True}
     except Exception as e:
         print(f"[MOOD LOG] non-fatal: {e}")
@@ -1368,6 +1403,7 @@ async def send_request(body: FriendRequestBody):
             "recipient_id": rec_id,
             "status":       "pending",
         }).execute()
+        _track_feature(body.requester_id, "friends")
         return {"success": True}
     except Exception as e:
         if "duplicate" in str(e).lower():
@@ -1524,6 +1560,52 @@ async def send_alert(body: SafetyAlertBody):
         if success:
             alerted += 1
     return {"alerted": alerted}
+
+
+# ----------------------------
+# BETA MEASUREMENT — server-side counts only, never message content.
+# Fire-and-forget from Flutter: don't await, don't block UI, don't
+# surface errors to the user.
+# ----------------------------
+
+class SafeSpaceLog(BaseModel):
+    user_id: str
+    outcome: str = ""  # 'better' | 'same' | 'rough' | ''
+
+
+class JournalLog(BaseModel):
+    user_id: str
+    template: str  # 'daily' | 'gratitude' | 'worry_sort'
+
+
+@app.post("/log-safe-space")
+async def log_safe_space_server(body: SafeSpaceLog):
+    try:
+        supabase.table("safe_space_logs").insert({
+            "user_id":   body.user_id,
+            "outcome":   body.outcome or None,
+            "logged_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        _track_feature(body.user_id, "safe_space")
+        return {"success": True}
+    except Exception as e:
+        print(f"[SAFE SPACE LOG] non-fatal: {e}")
+        return {"success": False}
+
+
+@app.post("/log-journal-entry")
+async def log_journal_entry_server(body: JournalLog):
+    try:
+        supabase.table("journal_logs").insert({
+            "user_id":   body.user_id,
+            "template":  body.template,
+            "logged_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        _track_feature(body.user_id, "journal")
+        return {"success": True}
+    except Exception as e:
+        print(f"[JOURNAL LOG] non-fatal: {e}")
+        return {"success": False}
 
 
 # ----------------------------
@@ -1702,3 +1784,126 @@ async def admin_users(_: bool = Depends(check_admin)):
 
     users.sort(key=lambda u: u["last_active"] or "", reverse=True)
     return {"users": users, "count": len(users)}
+
+
+@app.get("/admin/retention")
+async def admin_retention(_: bool = Depends(check_admin)):
+    # Fails soft with a clear message if the tracking columns from the
+    # beta-measurement migration haven't been run yet, instead of a 500.
+    try:
+        profiles = supabase_admin.table("user_profiles") \
+            .select("device_user_id, signup_at, first_action, "
+                    "has_used_chai, has_used_journal, has_used_safe_space, "
+                    "has_used_mood, has_used_friends") \
+            .execute()
+    except Exception as e:
+        print(f"[ADMIN RETENTION] columns not migrated yet: {e}")
+        return {"migrated": False}
+
+    profiles_data = [p for p in (profiles.data or []) if p.get("signup_at")]
+    total = len(profiles_data)
+    if total == 0:
+        return {
+            "migrated": True, "total_tracked_users": 0,
+            "day1_return_pct": 0, "day7_return_pct": 0,
+            "day14_return_pct": 0, "day30_return_pct": 0,
+            "avg_active_days_per_user": 0,
+            "feature_reach_pct": {}, "first_action_distribution": {},
+        }
+
+    all_logs = supabase_admin.table("chat_logs") \
+        .select("user_id, created_at").execute()
+    user_dates = defaultdict(set)
+    for row in all_logs.data or []:
+        user_dates[row["user_id"]].add(row["created_at"][:10])
+
+    day1 = day7 = day14 = day30 = 0
+    session_day_counts = []
+    feature_keys = ["chai", "journal", "safe_space", "mood", "friends"]
+    feature_counts = {k: 0 for k in feature_keys}
+    first_action_counts = {}
+
+    for p in profiles_data:
+        uid = p["device_user_id"]
+        joined_dt = datetime.strptime(p["signup_at"][:10], "%Y-%m-%d")
+        dates = user_dates.get(uid, set())
+        session_day_counts.append(len(dates))
+
+        def active_on_day(n):
+            target = (joined_dt + timedelta(days=n)).strftime("%Y-%m-%d")
+            return target in dates
+
+        if active_on_day(1):
+            day1 += 1
+        if active_on_day(7):
+            day7 += 1
+        if active_on_day(14):
+            day14 += 1
+        if active_on_day(30):
+            day30 += 1
+
+        for feature in feature_keys:
+            if p.get(f"has_used_{feature}"):
+                feature_counts[feature] += 1
+
+        fa = p.get("first_action")
+        if fa:
+            first_action_counts[fa] = first_action_counts.get(fa, 0) + 1
+
+    avg_active_days = sum(session_day_counts) / len(session_day_counts)
+
+    return {
+        "migrated": True,
+        "total_tracked_users": total,
+        "day1_return_pct": round(day1 / total * 100, 1),
+        "day7_return_pct": round(day7 / total * 100, 1),
+        "day14_return_pct": round(day14 / total * 100, 1),
+        "day30_return_pct": round(day30 / total * 100, 1),
+        "avg_active_days_per_user": round(avg_active_days, 1),
+        "feature_reach_pct": {
+            k: round(v / total * 100, 1) for k, v in feature_counts.items()
+        },
+        "first_action_distribution": first_action_counts,
+    }
+
+
+@app.get("/admin/mood-trends")
+async def admin_mood_trends(_: bool = Depends(check_admin)):
+    # Aggregate only, by design — never per-individual mood scores.
+    try:
+        rows = supabase_admin.table("mood_logs") \
+            .select("mood, logged_at") \
+            .order("logged_at", desc=False).execute()
+    except Exception as e:
+        print(f"[ADMIN MOOD] mood_logs not available yet: {e}")
+        return {"weeks": []}
+
+    data = rows.data or []
+    if not data:
+        return {"weeks": []}
+
+    mood_score = {
+        "Hopeful": 90, "Calm": 75, "Tired": 55,
+        "Lonely": 40, "Stressed": 35, "Overwhelmed": 20,
+    }
+
+    def parse_ts(s):
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+    first_ts = parse_ts(data[0]["logged_at"])
+    week_scores = defaultdict(list)
+    for r in data:
+        week_num = (parse_ts(r["logged_at"]) - first_ts).days // 7
+        score = mood_score.get(r["mood"])
+        if score is not None:
+            week_scores[week_num].append(score)
+
+    weeks = [
+        {
+            "week": week_num + 1,
+            "avg_score": round(sum(scores) / len(scores), 1),
+            "check_ins": len(scores),
+        }
+        for week_num, scores in sorted(week_scores.items())
+    ]
+    return {"weeks": weeks}
