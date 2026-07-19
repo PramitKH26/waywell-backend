@@ -1279,16 +1279,27 @@ async def create_profile(body: ProfileCreate):
     if not is_valid_username(body.username):
         return {"error": "Username must be 3-20 chars, lowercase "
                           "letters, numbers, underscore only"}
+    username = body.username.strip().lower()
+
+    # A username held by a DIFFERENT device is a real conflict. The same
+    # device re-saving (e.g. editing their name later) is not — that's an
+    # update, not a collision, so it must never hard-fail here.
+    existing = supabase_admin.table("user_profiles") \
+        .select("device_user_id") \
+        .eq("username", username) \
+        .execute()
+    if existing.data and existing.data[0]["device_user_id"] != body.device_user_id:
+        return {"error": "Username taken"}
+
     try:
-        supabase_admin.table("user_profiles").insert({
+        supabase_admin.table("user_profiles").upsert({
             "device_user_id": body.device_user_id,
-            "username":       body.username.strip().lower(),
+            "username":       username,
             "display_name":   body.display_name,
-        }).execute()
+            "updated_at":     datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="device_user_id").execute()
         return {"success": True}
     except Exception as e:
-        if "duplicate" in str(e).lower():
-            return {"error": "Username taken"}
         print(f"[PROFILE CREATE] Error: {e}")
         return {"error": "Could not create profile"}
 
