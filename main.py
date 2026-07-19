@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import google.genai as genai
@@ -20,6 +21,21 @@ load_dotenv()
 
 # FastAPI app
 app = FastAPI()
+
+# CORS — only needed for the browser-based admin dashboard (the Flutter app
+# talks to this backend over native HTTP, which isn't subject to CORS).
+# Scoped to the admin dashboard's known origins, not left wide open.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://admin.waywell.in",
+        "http://localhost:8791",
+        "http://127.0.0.1:8791",
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_methods=["GET", "POST"],
+    allow_headers=["X-Admin-Password", "Content-Type"],
+)
 
 # Gemini Client
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
