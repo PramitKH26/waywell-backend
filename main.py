@@ -4,7 +4,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import google.genai as genai
@@ -1508,3 +1508,181 @@ async def send_alert(body: SafetyAlertBody):
         if success:
             alerted += 1
     return {"alerted": alerted}
+
+
+# ----------------------------
+# ADMIN DASHBOARD — password-gated aggregate endpoints.
+# Uses supabase_admin (service-role) since these read across all users,
+# bypassing per-user RLS. Never returns raw chat message text.
+# ----------------------------
+
+def check_admin(x_admin_password: str = Header(None)):
+    expected = os.environ.get("ADMIN_PASSWORD")
+    if not expected or x_admin_password != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return True
+
+
+@app.get("/admin/overview")
+async def admin_overview(_: bool = Depends(check_admin)):
+    now = datetime.now(timezone.utc)
+    day_ago = (now - timedelta(days=1)).isoformat()
+    week_ago = (now - timedelta(days=7)).isoformat()
+    month_ago = (now - timedelta(days=30)).isoformat()
+
+    all_users = supabase_admin.table("chat_logs").select("user_id").execute()
+    total_users = len(set(r["user_id"] for r in all_users.data or []))
+
+    active_24h_rows = supabase_admin.table("chat_logs") \
+        .select("user_id").gte("created_at", day_ago).execute()
+    active_24h = len(set(r["user_id"] for r in active_24h_rows.data or []))
+
+    active_7d_rows = supabase_admin.table("chat_logs") \
+        .select("user_id").gte("created_at", week_ago).execute()
+    active_7d = len(set(r["user_id"] for r in active_7d_rows.data or []))
+
+    active_30d_rows = supabase_admin.table("chat_logs") \
+        .select("user_id").gte("created_at", month_ago).execute()
+    active_30d = len(set(r["user_id"] for r in active_30d_rows.data or []))
+
+    total_messages = supabase_admin.table("chat_logs") \
+        .select("id", count="exact").execute()
+    total_msg_count = total_messages.count or 0
+
+    msgs_7d = supabase_admin.table("chat_logs") \
+        .select("id", count="exact").gte("created_at", week_ago).execute()
+
+    avg_msgs_per_active = (
+        (msgs_7d.count or 0) / active_7d if active_7d > 0 else 0
+    )
+
+    crisis_7d = supabase_admin.table("chat_logs") \
+        .select("id", count="exact") \
+        .eq("was_crisis", True).gte("created_at", week_ago).execute()
+
+    soft_7d = supabase_admin.table("chat_logs") \
+        .select("id", count="exact") \
+        .eq("soft_concern_flag", True).gte("created_at", week_ago).execute()
+
+    downgrades_7d = supabase_admin.table("chat_logs") \
+        .select("id", count="exact") \
+        .eq("tag_downgraded", True).gte("created_at", week_ago).execute()
+    downgrade_rate = (
+        (downgrades_7d.count or 0) / (msgs_7d.count or 1) * 100
+    )
+
+    # `reviewed` column is added by a one-time migration — fail soft until
+    # it exists so the rest of the overview still loads.
+    try:
+        unread_feedback = supabase_admin.table("feedback") \
+            .select("id", count="exact").eq("reviewed", False).execute()
+        unread_feedback_count = unread_feedback.count or 0
+    except Exception as e:
+        print(f"[ADMIN OVERVIEW] feedback.reviewed not available yet: {e}")
+        unread_feedback_count = 0
+
+    return {
+        "total_users": total_users,
+        "active_24h": active_24h,
+        "active_7d": active_7d,
+        "active_30d": active_30d,
+        "total_messages": total_msg_count,
+        "messages_7d": msgs_7d.count or 0,
+        "avg_msgs_per_active_7d": round(avg_msgs_per_active, 1),
+        "crisis_flags_7d": crisis_7d.count or 0,
+        "soft_concern_flags_7d": soft_7d.count or 0,
+        "downgrade_rate_pct": round(downgrade_rate, 1),
+        "unread_feedback": unread_feedback_count,
+    }
+
+
+@app.get("/admin/feedback")
+async def admin_feedback(_: bool = Depends(check_admin)):
+    result = supabase_admin.table("feedback") \
+        .select("*").order("created_at", desc=True).execute()
+    return {"items": result.data}
+
+
+@app.post("/admin/feedback/{item_id}/reviewed")
+async def mark_feedback_reviewed(
+    item_id: str, reviewed: bool = True, _: bool = Depends(check_admin)
+):
+    supabase_admin.table("feedback").update(
+        {"reviewed": reviewed}
+    ).eq("id", item_id).execute()
+    return {"success": True}
+
+
+@app.get("/admin/chat-signals")
+async def admin_chat_signals(_: bool = Depends(check_admin)):
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    rows = supabase_admin.table("chat_logs") \
+        .select("response_tool, socratic_angle, edu_topic, story_matched, "
+                "soft_concern_flag, tag_downgraded") \
+        .gte("created_at", week_ago).execute()
+
+    tool_counts = {}
+    angle_counts = {}
+    edu_counts = {}
+    stories_matched = 0
+    total = len(rows.data or [])
+
+    for r in rows.data or []:
+        t = r.get("response_tool") or "unknown"
+        tool_counts[t] = tool_counts.get(t, 0) + 1
+        a = r.get("socratic_angle")
+        if a:
+            angle_counts[a] = angle_counts.get(a, 0) + 1
+        e = r.get("edu_topic")
+        if e:
+            edu_counts[e] = edu_counts.get(e, 0) + 1
+        if r.get("story_matched"):
+            stories_matched += 1
+
+    return {
+        "period": "last_7_days",
+        "total_messages": total,
+        "response_tool_distribution": tool_counts,
+        "socratic_angles_used": angle_counts,
+        "edu_topics_used": edu_counts,
+        "story_match_rate_pct": round(
+            stories_matched / total * 100, 1
+        ) if total > 0 else 0,
+    }
+
+
+@app.get("/admin/wellbeing-reports")
+async def admin_wellbeing(_: bool = Depends(check_admin)):
+    # Feature not built yet — table may not exist. Fail soft so the
+    # dashboard tab can render an empty state instead of a 500.
+    try:
+        result = supabase_admin.table("wellbeing_reports") \
+            .select("*").order("submitted_at", desc=True).execute()
+        return {"items": result.data}
+    except Exception as e:
+        print(f"[ADMIN WELLBEING] table not available yet: {e}")
+        return {"items": []}
+
+
+@app.get("/admin/users")
+async def admin_users(_: bool = Depends(check_admin)):
+    profiles = supabase_admin.table("user_profiles") \
+        .select("username, display_name, device_user_id, created_at") \
+        .execute()
+
+    users = []
+    for p in profiles.data or []:
+        last_msg = supabase_admin.table("chat_logs") \
+            .select("created_at") \
+            .eq("user_id", p["device_user_id"]) \
+            .order("created_at", desc=True).limit(1).execute()
+        last_active = last_msg.data[0]["created_at"] if last_msg.data else None
+        users.append({
+            "username": p.get("username"),
+            "display_name": p.get("display_name"),
+            "joined": p.get("created_at"),
+            "last_active": last_active,
+        })
+
+    users.sort(key=lambda u: u["last_active"] or "", reverse=True)
+    return {"users": users, "count": len(users)}
