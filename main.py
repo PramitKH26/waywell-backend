@@ -198,7 +198,7 @@ def get_recent_state(user_id):
     used_topics, used_angles, recent_tools = [], [], []
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-        result = supabase.table("chat_logs") \
+        result = supabase_admin.table("chat_logs") \
             .select("edu_topic, socratic_angle") \
             .eq("user_id", user_id) \
             .gte("created_at", cutoff) \
@@ -212,7 +212,7 @@ def get_recent_state(user_id):
         print(f"[STATE] 24h tag query failed: {e}")
 
     try:
-        result = supabase.table("chat_logs") \
+        result = supabase_admin.table("chat_logs") \
             .select("response_tool, created_at") \
             .eq("user_id", user_id) \
             .order("created_at", desc=True) \
@@ -410,7 +410,7 @@ def _log_chat(user_id: str, message_length: int,
     """
     _track_feature(user_id, "chai")
     try:
-        supabase.table("chat_logs").insert({
+        supabase_admin.table("chat_logs").insert({
             "user_id":           user_id,
             "message_length":    message_length,
             "was_crisis":        was_crisis,
@@ -1250,7 +1250,7 @@ async def mood_log(entry: MoodLog):
     """Store a mood check-in. Non-fatal — never breaks the app."""
     try:
         ts = entry.timestamp or datetime.now(timezone.utc).isoformat()
-        supabase.table("mood_logs").insert({
+        supabase_admin.table("mood_logs").insert({
             "user_id":   entry.user_id,
             "mood":      entry.mood,
             "source":    entry.source,
@@ -1267,7 +1267,7 @@ async def mood_log(entry: MoodLog):
 async def mood_action(entry: MoodAction):
     """Track what the user does immediately after a mood check-in."""
     try:
-        supabase.table("mood_actions").insert({
+        supabase_admin.table("mood_actions").insert({
             "user_id":      entry.user_id,
             "initial_mood": entry.initial_mood,
             "next_action":  entry.next_action,
@@ -1301,7 +1301,7 @@ async def submit_feedback(feedback: Feedback):
     if not feedback.message.strip():
         return {"error": "Message required"}
     try:
-        supabase.table("feedback").insert({
+        supabase_admin.table("feedback").insert({
             "user_id":     feedback.user_id,
             "category":    feedback.category,
             "message":     feedback.message,
@@ -1581,7 +1581,7 @@ class JournalLog(BaseModel):
 @app.post("/log-safe-space")
 async def log_safe_space_server(body: SafeSpaceLog):
     try:
-        supabase.table("safe_space_logs").insert({
+        supabase_admin.table("safe_space_logs").insert({
             "user_id":   body.user_id,
             "outcome":   body.outcome or None,
             "logged_at": datetime.now(timezone.utc).isoformat(),
@@ -1596,7 +1596,7 @@ async def log_safe_space_server(body: SafeSpaceLog):
 @app.post("/log-journal-entry")
 async def log_journal_entry_server(body: JournalLog):
     try:
-        supabase.table("journal_logs").insert({
+        supabase_admin.table("journal_logs").insert({
             "user_id":   body.user_id,
             "template":  body.template,
             "logged_at": datetime.now(timezone.utc).isoformat(),
